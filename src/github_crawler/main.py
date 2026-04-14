@@ -41,6 +41,13 @@ class CodeAgent:
         self.repo_path = repo_path
         genai.configure(api_key=api_key)
         
+        # Robust model selection
+        try:
+            available_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
+            model_to_use = next((m for m in available_models if 'gemini-1.5-flash' in m), 'gemini-1.5-flash')
+        except Exception:
+            model_to_use = 'gemini-1.5-flash'
+        
         system_instruction = f"""
         You are a Smart Code Search Agent. Your goal is to analyze the local repository at '{repo_path}'.
         You have access to the following 'tools' via plain text commands:
@@ -53,9 +60,8 @@ class CodeAgent:
         Example: LS src/
         """
         
-        # Using the standard model identifier
         self.model = genai.GenerativeModel(
-            model_name='gemini-1.5-flash',
+            model_name=model_to_use,
             system_instruction=system_instruction
         )
         self.chat = self.model.start_chat(history=[])
