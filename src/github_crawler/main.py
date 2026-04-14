@@ -119,7 +119,6 @@ class CodeAgent:
         )
         
         layout["header"].update(Panel(f"[bold cyan]Agent analyzing: {self.repo_name}[/bold cyan]", border_style="cyan"))
-        
         thought_log = "\n".join([f"> {t['thought'][:100]}..." for t in self.trace[-5:]])
         layout["thoughts"].update(Panel(thought_log or "Waiting for first thought...", title="Recent Thoughts"))
         
@@ -130,40 +129,47 @@ class CodeAgent:
         
         return layout
 
-    def run_session(self, task: str):
+    def run_session(self, task: str, silent: bool = False):
         current_prompt = f"TASK: {task}\n\nAnalyze the repo and find the answer. Use LS, READ, or GREP as needed."
         
-        with Live(self.make_dashboard(), refresh_per_second=4) as live:
+        def process_turn(turn, prompt):
+            try:
+                response_obj = self.chat.send_message(prompt)
+                response = response_obj.text.strip()
+            except Exception as e:
+                return f"Model Error: {str(e)}", True
+            
+            self.trace.append({"turn": turn+1, "thought": response, "output": ""})
+            
+            if response.startswith("DONE"):
+                final_msg = response[5:].strip()
+                self.trace[-1]["output"] = final_msg
+                return final_msg, True
+            
+            if response.startswith("LS"):
+                output = self.tool_ls(response[3:].strip() or ".")
+            elif response.startswith("READ"):
+                output = self.tool_read(response[5:].strip())
+            elif response.startswith("GREP"):
+                output = self.tool_grep(response[5:].strip().strip('"'))
+            else:
+                output = "Unknown tool call. Use LS, READ, GREP, or DONE."
+            
+            self.trace[-1]["output"] = output
+            return f"TOOL OUTPUT:\n{output}\n\nNext step?", False
+
+        if silent:
             for turn in range(12):
-                try:
-                    response_obj = self.chat.send_message(current_prompt)
-                    response = response_obj.text.strip()
-                except Exception as e:
-                    error_msg = f"Model Error: {str(e)}"
-                    self.trace.append({"turn": turn+1, "thought": error_msg, "output": ""})
-                    return error_msg
-
-                self.trace.append({"turn": turn+1, "thought": response, "output": ""})
-                live.update(self.make_dashboard())
-
-                if response.startswith("DONE"):
-                    final_msg = response[5:].strip()
-                    self.trace[-1]["output"] = final_msg
-                    return final_msg
-                
-                # Simple parser
-                if response.startswith("LS"):
-                    output = self.tool_ls(response[3:].strip() or ".")
-                elif response.startswith("READ"):
-                    output = self.tool_read(response[5:].strip())
-                elif response.startswith("GREP"):
-                    output = self.tool_grep(response[5:].strip().strip('"'))
-                else:
-                    output = "Unknown tool call. Use LS, READ, GREP, or DONE."
-                
-                self.trace[-1]["output"] = output
-                current_prompt = f"TOOL OUTPUT:\n{output}\n\nNext step?"
-                live.update(self.make_dashboard())
+                res, is_done = process_turn(turn, current_prompt)
+                if is_done: return res
+                current_prompt = res
+        else:
+            with Live(self.make_dashboard(), refresh_per_second=4) as live:
+                for turn in range(12):
+                    res, is_done = process_turn(turn, current_prompt)
+                    live.update(self.make_dashboard())
+                    if is_done: return res
+                    current_prompt = res
         
         return "Agent timed out."
 
@@ -207,6 +213,7 @@ def main():
     language = Prompt.ask("[bold]Language[/bold] (optional)", default="")
     task = Prompt.ask("[bold]Deep Search Task[/bold]", default="Find the core logic")
     limit = IntPrompt.ask("[bold]Limit[/bold]", default=2)
+    run_background = Confirm.ask("[bold azure]Run Agent in Background? (Output to file)[/bold azure]", default=False)
     
     g = Github(github_token) if github_token else Github()
     results = []
@@ -219,24 +226,34 @@ def main():
         console.print(f"[bold red]Search Error:[/bold red] {e}")
         return
 
-    for repo in repos_to_process:
-        temp_dir = tempfile.mkdtemp()
-        try:
-            subprocess.run(["git", "clone", "--depth", "1", repo.clone_url, temp_dir], check=True, capture_output=True)
-            agent = CodeAgent(repo.full_name, temp_dir, google_key)
-            analysis = agent.run_session(task)
+    # Use Progress if in background
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=console,
+        transient=True,
+    ) as progress:
+        for repo in repos_to_process:
+            if run_background:
+                progress.add_task(description=f"Background Agent Analysis for {repo.full_name}...", total=None)
             
-            results.append({
-                "name": repo.full_name,
-                "url": repo.html_url,
-                "stars": repo.stargazers_count,
-                "language": repo.language or "N/A",
-                "analysis": analysis,
-                "trace": agent.trace,
-                "files_touched": list(agent.files_touched)
-            })
-        finally:
-            shutil.rmtree(temp_dir, ignore_errors=True)
+            temp_dir = tempfile.mkdtemp()
+            try:
+                subprocess.run(["git", "clone", "--depth", "1", repo.clone_url, temp_dir], check=True, capture_output=True)
+                agent = CodeAgent(repo.full_name, temp_dir, google_key)
+                analysis = agent.run_session(task, silent=run_background)
+                
+                results.append({
+                    "name": repo.full_name,
+                    "url": repo.html_url,
+                    "stars": repo.stargazers_count,
+                    "language": repo.language or "N/A",
+                    "analysis": analysis,
+                    "trace": agent.trace,
+                    "files_touched": list(agent.files_touched)
+                })
+            finally:
+                shutil.rmtree(temp_dir, ignore_errors=True)
 
     # Main Results Table
     table = Table(title="\nGlobal Search Results", show_header=True, header_style="bold magenta")
@@ -248,6 +265,21 @@ def main():
         table.add_row(str(i+1), res["name"], res["analysis"])
     console.print(table)
 
+    # If background mode, automatically save to text file
+    if run_background:
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        log_file = f"agent_results_{ts}.txt"
+        with open(log_file, "w") as f:
+            f.write(f"GH CRAWLER BACKGROUND SCAN REPORT - {ts}\n")
+            f.write(f"Task: {task}\n")
+            f.write("="*50 + "\n\n")
+            for res in results:
+                f.write(f"REPO: {res['name']} ({res['url']})\n")
+                f.write(f"STARS: {res['stars']} | LANG: {res['language']}\n")
+                f.write(f"ANALYSIS: {res['analysis']}\n")
+                f.write("-" * 30 + "\n\n")
+        console.print(f"[bold green]Background scan complete. Results saved to {log_file}[/bold green]")
+
     # Post-Scan Menu
     while True:
         choice = Prompt.ask(
@@ -255,7 +287,6 @@ def main():
             choices=["deep", "tree", "json", "md", "quit"], 
             default="quit"
         )
-        
         if choice == "quit": break
         
         if choice in ["deep", "tree"]:
@@ -272,12 +303,10 @@ def main():
                     console.print(tree)
             else:
                 console.print("[red]Invalid ID[/red]")
-                
         elif choice == "json":
             filename = f"gh_pro_{datetime.now().strftime('%H%M%S')}.json"
             with open(filename, "w") as f: json.dump(results, f, indent=4)
             console.print(f"[green]Saved to {filename}[/green]")
-            
         elif choice == "md":
             filename = f"report_{datetime.now().strftime('%H%M%S')}.md"
             with open(filename, "w") as f: f.write(generate_markdown_report(results, task))
