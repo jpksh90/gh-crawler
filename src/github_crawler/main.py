@@ -239,7 +239,7 @@ def main():
             
             temp_dir = tempfile.mkdtemp()
             try:
-                subprocess.run(["git", "clone", "--depth", "1", repo.clone_url, temp_dir], check=True, capture_output=True)
+                subprocess.run(["git", "clone", "--depth", "1", repo.ssh_url, temp_dir], check=True, capture_output=True)
                 agent = CodeAgent(repo.full_name, temp_dir, google_key)
                 analysis = agent.run_session(task, silent=run_background)
                 
