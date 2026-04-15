@@ -45,7 +45,6 @@ class SearchSynthesizer:
     def __init__(self, google_key: Optional[str] = None, openai_key: Optional[str] = None):
         self.provider: Optional[AIProvider] = None
         
-        # Priority: OpenAI then Google (Strategy selection)
         if openai_key:
             self.provider = OpenAIProvider(openai_key)
         elif google_key:
@@ -65,12 +64,24 @@ class SearchSynthesizer:
         Deep Query: "{deep_query}"
         
         Provide the output in JSON format with the following keys:
-        - keywords: (str) A string of space-separated keywords/tags.
+        - keywords: (str) A string of space-separated keywords/tags for general search.
+        - labels: (list[str]) Specific labels or categories that best describe the repository's purpose or technology.
         - language: (str, optional) The primary programming language.
         - min_stars: (int, optional) Minimum number of stars.
         - min_forks: (int, optional) Minimum number of forks.
         - license: (str, optional) License type (e.g., mit, apache-2.0).
         - reasoning: (str) A brief explanation of why these parameters were chosen.
+
+        Example:
+        Query: "Find modern async Python web frameworks with OIDC support"
+        Output:
+        {{
+            "keywords": "async python web framework",
+            "labels": ["web", "framework", "python", "oidc"],
+            "language": "python",
+            "min_stars": 100,
+            "reasoning": "Looking for Python frameworks with 'async' and 'oidc' as core features."
+        }}
         """
         
         try:
