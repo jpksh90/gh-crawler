@@ -5,9 +5,7 @@ import tempfile
 import time
 from datetime import datetime
 from rich.console import Console
-from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.prompt import Prompt, IntPrompt, Confirm
-from rich.panel import Panel
 from rich.tree import Tree
 from rich.markup import escape
 from pyfiglet import figlet_format
@@ -20,10 +18,15 @@ from github_crawler.github_utils import count_lines_of_code, get_repo_tree, clon
 from github_crawler.config import load_yaml_config, save_config, load_project_memory, save_project_memory
 from github_crawler.reporting import generate_markdown_report, display_results_table, save_background_report
 from github_crawler.cli import parse_args, explore_repo_files, add_tree_nodes
+from github_crawler.events import event_bus, EventType
+from github_crawler.ui_handler import RichUIHandler
 
 console = Console()
 
 def main():
+    # Initialize UI Handler (listens to event_bus)
+    ui = RichUIHandler()
+    
     errors_encountered = []
     args = parse_args()
     config = load_yaml_config()
@@ -36,7 +39,7 @@ def main():
     # --- Configuration Loading ---
     memory_file = ".gemini_project_memory.json"
     project_memory = load_project_memory(memory_file)
-    loaded_search_criteria = project_memory.get("search_params")
+    loaded_search_criteria = project_memory.get("search_params", {})
     cached_analysis = project_memory.get("cached_analysis", {})
 
     use_saved_criteria = False
@@ -86,22 +89,17 @@ def main():
             task = Prompt.ask("[bold]Deep Search Task[/bold]", default="Find the core logic")
         
         if Confirm.ask("[bold magenta]Synthesize interesting search patterns from your Deep Search Task? (Y/n)[/bold magenta]", default=True):
-            with console.status("[bold cyan]Synthesizing search patterns...[/bold cyan]"):
-                synthesizer = SearchSynthesizer(google_key=google_key, openai_key=openai_key)
-                synth_params = synthesizer.synthesize(task)
-                
-                keywords = synth_params.get("keywords", keywords)
-                language = synth_params.get("language", language)
-                min_stars = synth_params.get("min_stars", min_stars)
-                min_forks = synth_params.get("min_forks", min_forks)
-                license_filter = synth_params.get("license", license_filter)
-                
-                reasoning = synth_params.get("reasoning", "No reasoning provided.")
-                console.print(Panel(f"[bold green]Synthesized Search Criteria:[/bold green]\n"
-                                    f"[cyan]Keywords:[/cyan] {keywords}\n"
-                                    f"[cyan]Language:[/cyan] {language}\n"
-                                    f"[cyan]Min Stars:[/cyan] {min_stars}\n"
-                                    f"[cyan]Reasoning:[/cyan] {reasoning}"))
+            event_bus.emit(EventType.SYNTHESIS_STARTED)
+            synthesizer = SearchSynthesizer(google_key=google_key, openai_key=openai_key)
+            synth_params = synthesizer.synthesize(task)
+            
+            keywords = synth_params.get("keywords", keywords)
+            language = synth_params.get("language", language)
+            min_stars = synth_params.get("min_stars", min_stars)
+            min_forks = synth_params.get("min_forks", min_forks)
+            license_filter = synth_params.get("license", license_filter)
+            
+            event_bus.emit(EventType.SYNTHESIS_FINISHED, synth_params)
 
     # Fallback to interactive prompts
     keywords = keywords if keywords is not None else Prompt.ask("[bold]Keywords (Tags)[/bold]", default="crawler")
@@ -132,6 +130,7 @@ def main():
         save_project_memory({"search_params": current_search_params, "cached_analysis": cached_analysis}, memory_file)
 
     # GitHub Search
+    event_bus.emit(EventType.SEARCH_STARTED)
     g = Github(github_token)
     token_bucket = TokenBucket(capacity=5, fill_rate=1.4) 
     results = []
@@ -155,53 +154,56 @@ def main():
                 repositories = g.search_repositories(query=query)
                 if repositories:
                     repos_to_process = [repositories[i] for i in range(min(limit, repositories.totalCount))]
-                    console.print(f"[green]Successfully retrieved {len(repos_to_process)} repositories.[/green]")
+                    event_bus.emit(EventType.SEARCH_SUCCESS, len(repos_to_process))
                     break
             else:
                 time.sleep(retry_delay)
         except GithubException as e:
-            console.print(f"[yellow]GitHub API error: {e}. Retrying...[/yellow]")
+            event_bus.emit(EventType.LOG, f"GitHub API error: {e}. Retrying...")
             time.sleep(retry_delay)
 
     if not repos_to_process:
-        console.print("[bold red]No repositories found or API error. Aborting.[/bold red]")
+        event_bus.emit(EventType.ERROR, "No repositories found or API error. Aborting.")
         return
 
     # Processing Repositories
-    with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console, transient=True) as progress:
-        for repo in repos_to_process:
-            cache_key = f"{repo.full_name}:{task}"
-            if cache_key in cached_analysis:
-                console.print(f"[yellow]Using cached results for {repo.full_name}.[/yellow]")
-                results.append(cached_analysis[cache_key])
-                continue
+    event_bus.emit(EventType.PROCESSING_STARTED)
+    for repo in repos_to_process:
+        cache_key = f"{repo.full_name}:{task}"
+        if cache_key in cached_analysis:
+            event_bus.emit(EventType.LOG, f"Using cached results for {repo.full_name}.")
+            results.append(cached_analysis[cache_key])
+            continue
 
-            if run_background:
-                progress.add_task(description=f"Analyzing {repo.full_name}...", total=None)
+        event_bus.emit(EventType.REPO_START, repo.full_name)
+        
+        temp_dir = tempfile.mkdtemp()
+        try:
+            clone_repo(repo.ssh_url, temp_dir)
+            agent = CodeAgent(repo.full_name, temp_dir, google_key, openai_key)
+            # Run agent silently because UIHandler handles status updates via events
+            analysis = agent.run_session(task, silent=True)
             
-            temp_dir = tempfile.mkdtemp()
-            try:
-                clone_repo(repo.ssh_url, temp_dir)
-                agent = CodeAgent(repo.full_name, temp_dir, google_key, openai_key)
-                analysis = agent.run_session(task, silent=run_background)
-                
-                repo_result = {
-                    "name": repo.full_name, "url": repo.html_url, "stars": repo.stargazers_count,
-                    "language": repo.language or "N/A", "lines_of_code": count_lines_of_code(temp_dir),
-                    "repo_tree": get_repo_tree(temp_dir), "analysis": analysis,
-                    "trace": agent.trace, "files_touched": list(agent.files_touched)
-                }
-                results.append(repo_result)
-                cached_analysis[cache_key] = repo_result
+            repo_result = {
+                "name": repo.full_name, "url": repo.html_url, "stars": repo.stargazers_count,
+                "language": repo.language or "N/A", "lines_of_code": count_lines_of_code(temp_dir),
+                "repo_tree": get_repo_tree(temp_dir), "analysis": analysis,
+                "trace": agent.trace, "files_touched": list(agent.files_touched)
+            }
+            results.append(repo_result)
+            cached_analysis[cache_key] = repo_result
+            event_bus.emit(EventType.REPO_SUCCESS, repo.full_name)
 
-                if not run_background and Confirm.ask(f"[bold]Explore {repo.full_name} files? (Y/n)[/bold]", default=False):
-                    explore_repo_files(temp_dir)
-            except Exception as e:
-                errors_encountered.append(f"Error processing {repo.full_name}: {e}")
-            finally:
-                shutil.rmtree(temp_dir, ignore_errors=True)
+            if not run_background and Confirm.ask(f"[bold]Explore {repo.full_name} files? (Y/n)[/bold]", default=False):
+                explore_repo_files(temp_dir)
+        except Exception as e:
+            event_bus.emit(EventType.REPO_ERROR, (repo.full_name, str(e)))
+            errors_encountered.append(f"Error processing {repo.full_name}: {e}")
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+    event_bus.emit(EventType.PROCESSING_FINISHED)
 
-    # Reporting
+    # Final Reporting (Directly using Rich for final summary tables and reports)
     display_results_table(results)
     if run_background:
         log_file = f"agent_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
