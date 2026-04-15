@@ -1,6 +1,4 @@
-def main():
-    print("Hello from github-crawler!")
-
+from github_crawler.main import main
 
 if __name__ == "__main__":
     main()
