@@ -1,5 +1,5 @@
 import json
-import google.generativeai as genai
+from google import genai
 import openai
 from abc import ABC, abstractmethod
 from typing import Dict, Any, Optional
@@ -11,11 +11,13 @@ class AIProvider(ABC):
 
 class GoogleAIProvider(AIProvider):
     def __init__(self, api_key: str):
-        genai.configure(api_key=api_key)
-        self.model = genai.GenerativeModel('gemini-1.5-flash')
+        self.client = genai.Client(api_key=api_key)
 
     def synthesize(self, prompt: str) -> str:
-        response = self.model.generate_content(prompt)
+        response = self.client.models.generate_content(
+            model='gemini-1.5-flash',
+            contents=prompt
+        )
         text = response.text.strip()
         # Clean up potential markdown wrapping
         if "```json" in text:

@@ -5,7 +5,7 @@ description = "A GitHub repository crawler with code scanning and Rich CLI"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "google-generativeai>=0.8.6",
+    "google-genai>=0.1.0",
     "openai>=1.0.0",
     "pygithub>=2.5.0",
     "rich>=13.0.0",
