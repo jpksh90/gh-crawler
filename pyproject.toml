@@ -12,6 +12,7 @@ dependencies = [
     "PyYAML>=6.0.0",
     "pyfiglet>=1.0.2",
     "inquirerpy>=0.3.4",
+    "pygount>=3.2.0",
 ]
 
 [project.scripts]

@@ -1,9 +1,11 @@
 import os
 import subprocess
 
+from pygount import SourceAnalysis
+
 def count_lines_of_code(repo_path: str):
     """
-    Counts the total lines of code in the repository, excluding hidden files and directories.
+    Counts total lines in the repository using pygount, excluding hidden files and directories.
     """
     total_lines = 0
     for root, dirs, files in os.walk(repo_path):
@@ -15,10 +17,10 @@ def count_lines_of_code(repo_path: str):
                 continue
             file_path = os.path.join(root, file)
             try:
-                with open(file_path, 'rb') as f:
-                    total_lines += sum(1 for _ in f)
+                analysis = SourceAnalysis.from_file(file_path, group=repo_path)
+                total_lines += analysis.line_count
             except Exception:
-                # Skip files that cannot be read
+                # Skip files that cannot be analyzed
                 continue
     return total_lines
 

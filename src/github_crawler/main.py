@@ -1,7 +1,6 @@
 import os
 import shutil
 import time
-import subprocess
 from datetime import datetime
 
 from github import GithubException, RateLimitExceededException, UnknownObjectException, BadCredentialsException
@@ -14,6 +13,7 @@ from github_crawler.config import Config
 from github_crawler.ui_handler import RichUIHandler
 from github_crawler.cli import parse_args, explore_repo_files
 from github_crawler.agent import CodeAgent
+from github_crawler.github_utils import clone_repo, count_lines_of_code
 from InquirerPy import inquirer
 from InquirerPy.base.control import Choice
 
@@ -93,9 +93,8 @@ def process_repository(repo, config: Config, temp_dir: str, task: str = "Analyze
         shutil.rmtree(temp_dir, ignore_errors=True) # Clean up previous clone
         os.makedirs(temp_dir, exist_ok=True)
         
-        # Use git command for cloning
-        repo_url = repo.clone_url
-        subprocess.run(["git", "clone", "--depth", "1", repo_url, temp_dir], check=True, capture_output=True)
+        # Use shared utility for cloning to keep clone behavior centralized.
+        clone_repo(repo.clone_url, temp_dir)
 
         # Use CodeAgent for analysis
         agent = CodeAgent(
@@ -109,20 +108,8 @@ def process_repository(repo, config: Config, temp_dir: str, task: str = "Analyze
         trace = agent.trace
         files_touched = list(agent.files_touched)
 
-        # Also count lines of code as a fallback/extra metric
-        lines_of_code = 0
-        for root, _, files in os.walk(temp_dir):
-            for file in files:
-                if file.endswith(".py"):
-                    file_path = os.path.join(root, file)
-                    try:
-                        with open(file_path, 'r', encoding='utf-8') as f:
-                            lines_of_code += len(f.readlines())
-                        rel_path = os.path.relpath(file_path, temp_dir)
-                        if rel_path not in files_touched:
-                            files_touched.append(rel_path)
-                    except Exception:
-                        pass
+        # Count lines with the shared pygount-backed utility.
+        lines_of_code = count_lines_of_code(temp_dir)
 
         result = {
             "name": repo_name,
@@ -307,7 +294,7 @@ def main():
                     os.makedirs(temp_explore_dir, exist_ok=True)
                     
                     repo_obj = next(r for r in repos_to_process if r.full_name == selected_repo_name)
-                    subprocess.run(["git", "clone", "--depth", "1", repo_obj.clone_url, temp_explore_dir], check=True, capture_output=True)
+                    clone_repo(repo_obj.clone_url, temp_explore_dir)
                     explore_repo_files(temp_explore_dir)
 
     else: # This block handles the case where repos_to_process is empty
