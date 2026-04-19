@@ -13,6 +13,7 @@ from rich.console import Console
 from github_crawler.config import Config
 from github_crawler.events import EventType, event_bus
 from github_crawler.main import run_crawler
+from github_crawler.session_store import delete_session, list_sessions
 
 console = Console()
 
@@ -49,21 +50,21 @@ HTML_PAGE = """<!DOCTYPE html>
 <body>
   <header>
     <h1>GH Crawler GUI</h1>
-    <div class=\"muted\">Browser-based interface for configuring and running repository scans.</div>
+    <div class=\"muted\">Browser-based interface for natural-language repository discovery, cloning, and source-property scans.</div>
   </header>
   <main>
     <section class=\"panel\">
       <h2>Scan Settings</h2>
       <div class=\"grid\">
         <div class=\"full\"><label>GitHub Token</label><input id=\"github_token\" type=\"password\" value=\"{{github_token}}\" /></div>
-        <div class=\"full\"><label>Keywords</label><input id=\"keywords\" value=\"{{keywords}}\" /></div>
+        <div class=\"full\"><label>Repository Request</label><input id=\"keywords\" value=\"{{keywords}}\" /></div>
         <div><label>Language</label><input id=\"language\" value=\"{{language}}\" /></div>
         <div><label>License</label><input id=\"license\" value=\"{{license}}\" /></div>
         <div><label>Minimum Stars</label><input id=\"min_stars\" value=\"{{min_stars}}\" /></div>
         <div><label>Minimum Forks</label><input id=\"min_forks\" value=\"{{min_forks}}\" /></div>
         <div><label>Limit</label><input id=\"limit\" value=\"{{limit}}\" /></div>
         <div><label>Save Background Report</label><input id=\"save_background_report\" type=\"checkbox\" {{save_background_checked}} /></div>
-        <div class=\"full\"><label>Task</label><textarea id=\"task\">{{task}}</textarea></div>
+        <div class=\"full\"><label>Source Property Request</label><textarea id=\"task\">{{task}}</textarea></div>
         <div class=\"full\"><label>Output Directory</label><input id=\"output_dir\" value=\"{{output_dir}}\" /></div>
         <div class=\"full\"><label>Temporary Directory</label><input id=\"temp_dir\" value=\"{{temp_dir}}\" /></div>
       </div>
@@ -78,6 +79,8 @@ HTML_PAGE = """<!DOCTYPE html>
 Current repository: none
 Progress: 0/0
 Last message: Ready.</pre>
+      <pre id="sessionSummary">Active session: none
+Session path: n/a</pre>
     </section>
     <section class=\"stack\">
       <div class=\"panel\">
@@ -96,6 +99,15 @@ Last message: Ready.</pre>
       <div class=\"panel\">
         <h2>Activity Log</h2>
         <pre id=\"logs\">Waiting for events...</pre>
+      </div>
+      <div class=\"panel\">
+        <h2>Sessions</h2>
+        <table>
+          <thead>
+            <tr><th>Session</th><th>Status</th><th>Repos</th><th>Action</th></tr>
+          </thead>
+          <tbody id=\"sessionsBody\"></tbody>
+        </table>
       </div>
     </section>
   </main>
@@ -150,6 +162,21 @@ Last message: Ready.</pre>
       }
     }
 
+    async function deleteSession(sessionId) {
+      const shouldDelete = window.confirm(`Delete session ${sessionId}?`);
+      if (!shouldDelete) {
+        return;
+      }
+      const persistArchive = window.confirm('Persist this session as a zip archive before deleting it?');
+      try {
+        const result = await postJson('/api/session/delete', { session_id: sessionId, persist_archive: persistArchive });
+        document.getElementById('message').textContent = result.message;
+        await refreshState();
+      } catch (error) {
+        document.getElementById('message').textContent = error.message;
+      }
+    }
+
     function renderDetails() {
       const details = document.getElementById('details');
       if (!lastState || selectedIndex === null || !lastState.results[selectedIndex]) {
@@ -159,15 +186,22 @@ Last message: Ready.</pre>
       const result = lastState.results[selectedIndex];
       const trace = (result.trace || []).map(item => `Turn ${item.turn}: ${item.thought}\n${item.output}`).join('\n\n') || 'No trace data.';
       const filesTouched = (result.files_touched || []).slice().sort().join('\n') || 'None';
+      const propertyMatches = (result.property_matches || []).map(
+        item => `${item.file_path}:${item.line_number} (${item.match_type}: ${item.pattern})\n${item.snippet}`
+      ).join('\n\n') || 'No direct matches.';
       details.textContent = [
         `Repository: ${result.name}`,
         `URL: ${result.url}`,
         `Stars: ${result.stars}`,
         `Language: ${result.language || 'Unknown'}`,
         `Lines of code: ${result.lines_of_code || 0}`,
+        `Clone path: ${result.clone_path || 'n/a'}`,
         '',
         'Analysis:',
         result.analysis,
+        '',
+        'Property matches:',
+        propertyMatches,
         '',
         'Files touched:',
         filesTouched,
@@ -189,6 +223,12 @@ Last message: Ready.</pre>
         `Current repository: ${progress.current_repo || 'none'}`,
         `Progress: ${progress.completed_repos || 0}/${progress.total_repos || 0}`,
         `Last message: ${progress.last_message || 'Ready.'}`,
+      ].join('\n');
+      const currentSession = state.current_session || {};
+      document.getElementById('sessionSummary').textContent = [
+        `Active session: ${currentSession.session_id || 'none'}`,
+        `Session path: ${currentSession.session_dir || 'n/a'}`,
+        currentSession.archive_path ? `Archive: ${currentSession.archive_path}` : 'Archive: none',
       ].join('\n');
 
       const resultsBody = document.getElementById('resultsBody');
@@ -219,6 +259,15 @@ Last message: Ready.</pre>
       } else {
         backgroundLink.style.display = 'none';
       }
+
+      const sessionsBody = document.getElementById('sessionsBody');
+      sessionsBody.innerHTML = '';
+      (state.sessions || []).forEach(session => {
+        const row = document.createElement('tr');
+        row.innerHTML = `<td>${session.session_id}</td><td>${session.status || ''}</td><td>${session.result_count || 0}</td><td><button class="secondary">Delete</button></td>`;
+        row.querySelector('button').onclick = () => deleteSession(session.session_id);
+        sessionsBody.appendChild(row);
+      });
     }
 
     async function refreshState() {
@@ -244,12 +293,13 @@ class BrowserGuiApp:
         self.logs = []
         self.results = []
         self.artifacts = {}
-        self.current_task = "Analyze repository structure"
+        self.current_task = ""
         self.phase = "idle"
         self.current_repo = None
         self.completed_repos = 0
         self.total_repos = 0
         self.last_message = "Ready."
+        self.current_session = {}
         self.server = None
         self._subscribe_to_events()
 
@@ -343,6 +393,7 @@ class BrowserGuiApp:
         args = type("GuiArgs", (), {
             "github_token": (payload.get("github_token") or "").strip() or None,
             "keywords": (payload.get("keywords") or "").strip() or None,
+            "labels": None,
             "language": (payload.get("language") or "").strip() or None,
             "min_stars": parse_int("min_stars", self.base_config.min_stars),
             "min_forks": parse_int("min_forks", self.base_config.min_forks),
@@ -352,14 +403,18 @@ class BrowserGuiApp:
         })()
 
         config = Config(args=args, config_file=self.base_config.config_file)
-        config.output_dir = (payload.get("output_dir") or self.base_config.output_dir).strip()
-        config.temp_dir = (payload.get("temp_dir") or self.base_config.temp_dir).strip()
+        output_dir = payload.get("output_dir")
+        temp_dir = payload.get("temp_dir")
+        config.output_dir = (output_dir.strip() if isinstance(output_dir, str) else None) or config.output_dir
+        config.temp_dir = (temp_dir.strip() if isinstance(temp_dir, str) else None) or config.temp_dir
         config.save_background_report = parse_bool("save_background_report", self.base_config.save_background_report)
         config.github_token = (payload.get("github_token") or config.github_token or "").strip() or None
         config.keywords = (payload.get("keywords") or config.keywords or "").strip() or None
         config.language = (payload.get("language") or config.language or "").strip() or None
-        os.makedirs(config.output_dir, exist_ok=True)
-        os.makedirs(config.temp_dir, exist_ok=True)
+        if config.output_dir:
+            os.makedirs(config.output_dir, exist_ok=True)
+        if config.temp_dir:
+            os.makedirs(config.temp_dir, exist_ok=True)
         return config
 
     def save_config(self, payload):
@@ -371,14 +426,37 @@ class BrowserGuiApp:
             self._append_log(self.status)
         return {"message": self.status}
 
+    def delete_session(self, payload):
+        session_id = (payload.get("session_id") or "").strip()
+        if not session_id:
+            raise ValueError("session_id is required.")
+        raw_persist_archive = payload.get("persist_archive")
+        if isinstance(raw_persist_archive, str):
+            persist_archive = raw_persist_archive.strip().lower() in {"1", "true", "yes", "on"}
+        else:
+            persist_archive = bool(raw_persist_archive)
+        archive_path = delete_session(self.base_config.output_dir, session_id, persist_archive=persist_archive)
+        message = f"Deleted session {session_id}"
+        if archive_path:
+            message += f" and archived it to {archive_path}"
+        with self.lock:
+            if self.current_session.get("session_id") == session_id:
+                self.current_session = {}
+            self.status = message
+            self._append_log(message)
+        return {"message": message, "archive_path": archive_path}
+
     def start_scan(self, payload):
         with self.lock:
             if self.running:
                 raise RuntimeError("A scan is already running.")
 
         config = self._payload_to_config(payload)
-        if not config.github_token or not config.keywords:
-            raise RuntimeError("GitHub token and keywords are required to run a scan.")
+        task = (payload.get("task") or "").strip()
+        if not config.github_token or not config.keywords or not task:
+            raise RuntimeError("GitHub token, repository request, and source property request are required to run a scan.")
+        if not config.output_dir or not config.temp_dir:
+            raise RuntimeError("Output and temporary directories must be provided explicitly.")
 
         config.save()
         with self.lock:
@@ -393,7 +471,8 @@ class BrowserGuiApp:
             self.current_repo = None
             self.completed_repos = 0
             self.total_repos = 0
-            self.current_task = (payload.get("task") or "Analyze repository structure").strip() or "Analyze repository structure"
+            self.current_task = task
+            self.current_session = {}
 
         worker = threading.Thread(target=self._scan_worker, args=(config, self.current_task), daemon=True)
         worker.start()
@@ -407,10 +486,17 @@ class BrowserGuiApp:
                 interactive=False,
                 render_console=False,
                 save_reports=True,
+                use_synthesis=True,
             )
             with self.lock:
+                session_info = {
+                    "session_id": artifacts.pop("session_id", None),
+                    "session_dir": artifacts.pop("session_dir", None),
+                    "archive_path": artifacts.pop("archive_path", None),
+                }
                 self.results = results
                 self.artifacts = artifacts
+                self.current_session = {key: value for key, value in session_info.items() if value}
                 self.phase = "complete"
                 self.current_repo = None
                 self.status = f"Completed: {len(results)} repositories"
@@ -438,6 +524,8 @@ class BrowserGuiApp:
                     "total_repos": self.total_repos,
                     "last_message": self.last_message,
                 },
+                "current_session": dict(self.current_session),
+                "sessions": list_sessions(self.base_config.output_dir) if self.base_config.output_dir else [],
                 "artifacts": {
                     name: bool(path) and os.path.exists(path)
                     for name, path in self.artifacts.items()
@@ -450,12 +538,12 @@ class BrowserGuiApp:
             "keywords": self.base_config.keywords or "",
             "language": self.base_config.language or "",
             "license": self.base_config.license or "",
-            "min_stars": str(self.base_config.min_stars),
-            "min_forks": str(self.base_config.min_forks),
-            "limit": str(self.base_config.limit),
-            "task": self.current_task,
-            "output_dir": self.base_config.output_dir,
-            "temp_dir": self.base_config.temp_dir,
+            "min_stars": "" if self.base_config.min_stars is None else str(self.base_config.min_stars),
+            "min_forks": "" if self.base_config.min_forks is None else str(self.base_config.min_forks),
+            "limit": "" if self.base_config.limit is None else str(self.base_config.limit),
+            "task": self.current_task or "",
+            "output_dir": self.base_config.output_dir or "",
+            "temp_dir": self.base_config.temp_dir or "",
             "save_background_checked": "checked" if self.base_config.save_background_report else "",
         }
         page = HTML_PAGE
@@ -533,6 +621,9 @@ class BrowserGuiApp:
                         return
                     if parsed.path == "/api/scan/start":
                         app._json_response(self, 200, app.start_scan(payload))
+                        return
+                    if parsed.path == "/api/session/delete":
+                        app._json_response(self, 200, app.delete_session(payload))
                         return
                     app._json_response(self, 404, {"error": "Not found"})
                 except Exception as exc:

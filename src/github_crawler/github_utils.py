@@ -49,8 +49,8 @@ def get_repo_tree(repo_path: str):
                 current[file] = None # Mark as file
     return tree_data
 
-def clone_repo(ssh_url: str, temp_dir: str):
+def clone_repo(clone_url: str, temp_dir: str):
     """
     Clones a repository using git.
     """
-    subprocess.run(["git", "clone", "--depth", "1", ssh_url, temp_dir], check=True, capture_output=True)
+    subprocess.run(["git", "clone", "--depth", "1", clone_url, temp_dir], check=True, capture_output=True)

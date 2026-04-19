@@ -12,171 +12,205 @@ from github_crawler.main import main
 
 
 class TestGuiMode(unittest.TestCase):
-	def setUp(self):
-		self.test_dir = tempfile.mkdtemp()
-		self.config_path = os.path.join(self.test_dir, "gui-config.yaml")
-		self.output_dir = os.path.join(self.test_dir, "output")
-		self.temp_dir = os.path.join(self.test_dir, "temp")
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.config_path = os.path.join(self.test_dir, "gui-config.yaml")
+        self.output_dir = os.path.join(self.test_dir, "output")
+        self.temp_dir = os.path.join(self.test_dir, "temp")
 
-	def tearDown(self):
-		shutil.rmtree(self.test_dir)
+    def tearDown(self):
+        shutil.rmtree(self.test_dir)
 
-	def test_parse_args_accepts_gui_flag(self):
-		args = parse_args(["-g"])
+    def test_parse_args_accepts_gui_flag(self):
+        args = parse_args(["-g"])
 
-		self.assertTrue(args.gui)
+        self.assertTrue(args.gui)
 
-	def test_main_routes_to_gui_mode(self):
-		with patch("github_crawler.main.run_gui_mode") as run_gui_mode:
-			main(["-g"])
+    def test_parse_args_accepts_session_flags(self):
+        args = parse_args(["--list-sessions"])
 
-		run_gui_mode.assert_called_once_with()
+        self.assertTrue(args.list_sessions)
 
-	def test_browser_gui_save_config_persists_values(self):
-		app = BrowserGuiApp()
-		app.base_config = Config(args=None, config_file=self.config_path)
+    def test_parse_args_accepts_labels_flag(self):
+        args = parse_args(["--labels", "android,nativeactivity"])
 
-		payload = {
-			"github_token": "token-123",
-			"keywords": "graph crawler",
-			"language": "python",
-			"license": "mit",
-			"min_stars": "15",
-			"min_forks": "2",
-			"limit": "8",
-			"save_background_report": True,
-			"task": "Analyze dependency graph",
-			"output_dir": self.output_dir,
-			"temp_dir": self.temp_dir,
-		}
+        self.assertEqual(args.labels, "android,nativeactivity")
 
-		result = app.save_config(payload)
+    def test_main_routes_to_gui_mode(self):
+        with patch("github_crawler.main.run_gui_mode") as run_gui_mode:
+            main(["-g"])
 
-		saved = load_yaml_config(self.config_path)
-		self.assertIn("Configuration saved", result["message"])
-		self.assertEqual(saved["github_token"], "token-123")
-		self.assertEqual(saved["keywords"], "graph crawler")
-		self.assertEqual(saved["output_dir"], self.output_dir)
-		self.assertEqual(saved["temp_dir"], self.temp_dir)
+        run_gui_mode.assert_called_once_with()
 
-	def test_browser_gui_start_scan_uses_run_crawler_results(self):
-		app = BrowserGuiApp()
-		app.base_config = Config(args=None, config_file=self.config_path)
-		artifact_path = os.path.join(self.test_dir, "report.md")
-		with open(artifact_path, "w", encoding="utf-8") as handle:
-			handle.write("report")
+    def test_browser_gui_save_config_persists_values(self):
+        app = BrowserGuiApp()
+        app.base_config = Config(args=None, config_file=self.config_path)
 
-		payload = {
-			"github_token": "token-123",
-			"keywords": "graph crawler",
-			"language": "python",
-			"license": "mit",
-			"min_stars": "15",
-			"min_forks": "2",
-			"limit": "8",
-			"save_background_report": "true",
-			"task": "Analyze dependency graph",
-			"output_dir": self.output_dir,
-			"temp_dir": self.temp_dir,
-		}
+        payload = {
+            "github_token": "token-123",
+            "keywords": "graph crawler",
+            "language": "python",
+            "license": "mit",
+            "min_stars": "15",
+            "min_forks": "2",
+            "limit": "8",
+            "save_background_report": True,
+            "task": "Analyze dependency graph",
+            "output_dir": self.output_dir,
+            "temp_dir": self.temp_dir,
+        }
 
-		class ImmediateThread:
-			def __init__(self, target=None, args=None, daemon=None):
-				self.target = target
-				self.args = args or ()
+        result = app.save_config(payload)
 
-			def start(self):
-				if self.target:
-					self.target(*self.args)
+        saved = load_yaml_config(self.config_path)
+        self.assertIn("Configuration saved", result["message"])
+        self.assertEqual(saved["github_token"], "token-123")
+        self.assertEqual(saved["keywords"], "graph crawler")
+        self.assertEqual(saved["output_dir"], self.output_dir)
+        self.assertEqual(saved["temp_dir"], self.temp_dir)
 
-		with patch("github_crawler.gui.threading.Thread", ImmediateThread), \
-			 patch("github_crawler.gui.run_crawler", return_value=(
-				 [{
-					"name": "owner/repo",
-					"url": "https://example.com/repo",
-					"stars": 42,
-					"language": "Python",
-					"lines_of_code": 123,
-					"analysis": "Looks good.",
-					"trace": [],
-					"files_touched": [],
-				 }],
-				 {"markdown_report": artifact_path}
-			 )):
-			response = app.start_scan(payload)
+    def test_browser_gui_start_scan_uses_run_crawler_results(self):
+        app = BrowserGuiApp()
+        app.base_config = Config(args=None, config_file=self.config_path)
+        artifact_path = os.path.join(self.test_dir, "report.md")
+        with open(artifact_path, "w", encoding="utf-8") as handle:
+            handle.write("report")
 
-		state = app.snapshot()
-		self.assertEqual(response["message"], "Scan started.")
-		self.assertFalse(state["running"])
-		self.assertEqual(len(state["results"]), 1)
-		self.assertTrue(state["artifacts"]["markdown_report"])
-		self.assertIn("Completed: 1 repositories", state["status"])
-		self.assertEqual(state["progress"]["phase"], "complete")
-		self.assertEqual(state["progress"]["completed_repos"], 0)
+        payload = {
+            "github_token": "token-123",
+            "keywords": "graph crawler",
+            "language": "python",
+            "license": "mit",
+            "min_stars": "15",
+            "min_forks": "2",
+            "limit": "8",
+            "save_background_report": "true",
+            "task": "Analyze dependency graph",
+            "output_dir": self.output_dir,
+            "temp_dir": self.temp_dir,
+        }
 
-	def test_browser_gui_snapshot_contains_intermediate_messages(self):
-		app = BrowserGuiApp()
-		app.base_config = Config(args=None, config_file=self.config_path)
-		artifact_path = os.path.join(self.test_dir, "report.md")
-		with open(artifact_path, "w", encoding="utf-8") as handle:
-			handle.write("report")
+        class ImmediateThread:
+            def __init__(self, target=None, args=None, daemon=None):
+                self.target = target
+                self.args = args or ()
 
-		payload = {
-			"github_token": "token-123",
-			"keywords": "graph crawler",
-			"language": "python",
-			"license": "mit",
-			"min_stars": "15",
-			"min_forks": "2",
-			"limit": "8",
-			"save_background_report": True,
-			"task": "Analyze dependency graph",
-			"output_dir": self.output_dir,
-			"temp_dir": self.temp_dir,
-		}
+            def start(self):
+                if self.target:
+                    self.target(*self.args)
 
-		class ImmediateThread:
-			def __init__(self, target=None, args=None, daemon=None):
-				self.target = target
-				self.args = args or ()
+        with patch("github_crawler.gui.threading.Thread", ImmediateThread), patch(
+            "github_crawler.gui.run_crawler",
+            return_value=(
+                [
+                    {
+                        "name": "owner/repo",
+                        "url": "https://example.com/repo",
+                        "stars": 42,
+                        "language": "Python",
+                        "lines_of_code": 123,
+                        "analysis": "Looks good.",
+                        "trace": [],
+                        "files_touched": [],
+                        "property_matches": [],
+                        "clone_path": os.path.join(self.test_dir, "clone"),
+                    }
+                ],
+                {"markdown_report": artifact_path, "session_id": "session-1", "session_dir": self.temp_dir},
+            ),
+        ):
+            response = app.start_scan(payload)
 
-			def start(self):
-				if self.target:
-					self.target(*self.args)
+        state = app.snapshot()
+        self.assertEqual(response["message"], "Scan started.")
+        self.assertFalse(state["running"])
+        self.assertEqual(len(state["results"]), 1)
+        self.assertTrue(state["artifacts"]["markdown_report"])
+        self.assertIn("Completed: 1 repositories", state["status"])
+        self.assertEqual(state["progress"]["phase"], "complete")
+        self.assertEqual(state["progress"]["completed_repos"], 0)
+        self.assertEqual(state["current_session"]["session_id"], "session-1")
 
-		def fake_run_crawler(*_args, **_kwargs):
-			event_bus.emit(EventType.SEARCH_SUCCESS, 1)
-			event_bus.emit(EventType.PROCESSING_STARTED)
-			event_bus.emit(EventType.REPO_START, "owner/repo")
-			event_bus.emit(EventType.LOG, "owner/repo: cloning repository")
-			event_bus.emit(EventType.LOG, "owner/repo: starting analysis")
-			event_bus.emit(EventType.REPO_SUCCESS, "owner/repo")
-			event_bus.emit(EventType.PROCESSING_FINISHED)
-			return ([{
-				"name": "owner/repo",
-				"url": "https://example.com/repo",
-				"stars": 42,
-				"language": "Python",
-				"lines_of_code": 123,
-				"analysis": "Looks good.",
-				"trace": [],
-				"files_touched": [],
-			}], {"markdown_report": artifact_path})
+    def test_browser_gui_snapshot_contains_intermediate_messages(self):
+        app = BrowserGuiApp()
+        app.base_config = Config(args=None, config_file=self.config_path)
+        artifact_path = os.path.join(self.test_dir, "report.md")
+        with open(artifact_path, "w", encoding="utf-8") as handle:
+            handle.write("report")
 
-		with patch("github_crawler.gui.threading.Thread", ImmediateThread), \
-			 patch("github_crawler.gui.run_crawler", side_effect=fake_run_crawler):
-			app.start_scan(payload)
+        payload = {
+            "github_token": "token-123",
+            "keywords": "graph crawler",
+            "language": "python",
+            "license": "mit",
+            "min_stars": "15",
+            "min_forks": "2",
+            "limit": "8",
+            "save_background_report": True,
+            "task": "Analyze dependency graph",
+            "output_dir": self.output_dir,
+            "temp_dir": self.temp_dir,
+        }
 
-		state = app.snapshot()
-		joined_logs = "\n".join(state["logs"])
-		self.assertIn("owner/repo: cloning repository", joined_logs)
-		self.assertIn("owner/repo: starting analysis", joined_logs)
-		self.assertEqual(state["progress"]["total_repos"], 1)
-		self.assertEqual(state["progress"]["completed_repos"], 1)
-		self.assertEqual(state["progress"]["phase"], "complete")
-		self.assertEqual(state["progress"]["current_repo"], None)
+        class ImmediateThread:
+            def __init__(self, target=None, args=None, daemon=None):
+                self.target = target
+                self.args = args or ()
+
+            def start(self):
+                if self.target:
+                    self.target(*self.args)
+
+        def fake_run_crawler(*_args, **_kwargs):
+            event_bus.emit(EventType.SEARCH_SUCCESS, 1)
+            event_bus.emit(EventType.PROCESSING_STARTED)
+            event_bus.emit(EventType.REPO_START, "owner/repo")
+            event_bus.emit(EventType.LOG, "owner/repo: cloning repository")
+            event_bus.emit(EventType.LOG, "owner/repo: scanning source properties")
+            event_bus.emit(EventType.REPO_SUCCESS, "owner/repo")
+            event_bus.emit(EventType.PROCESSING_FINISHED)
+            return (
+                [
+                    {
+                        "name": "owner/repo",
+                        "url": "https://example.com/repo",
+                        "stars": 42,
+                        "language": "Python",
+                        "lines_of_code": 123,
+                        "analysis": "Looks good.",
+                        "trace": [],
+                        "files_touched": [],
+                        "property_matches": [],
+                        "clone_path": os.path.join(self.test_dir, "clone"),
+                    }
+                ],
+                {"markdown_report": artifact_path},
+            )
+
+        with patch("github_crawler.gui.threading.Thread", ImmediateThread), patch(
+            "github_crawler.gui.run_crawler", side_effect=fake_run_crawler
+        ):
+            app.start_scan(payload)
+
+        state = app.snapshot()
+        joined_logs = "\n".join(state["logs"])
+        self.assertIn("owner/repo: cloning repository", joined_logs)
+        self.assertIn("owner/repo: scanning source properties", joined_logs)
+        self.assertEqual(state["progress"]["total_repos"], 1)
+        self.assertEqual(state["progress"]["completed_repos"], 1)
+        self.assertEqual(state["progress"]["phase"], "complete")
+        self.assertEqual(state["progress"]["current_repo"], None)
+
+    def test_browser_gui_delete_session_routes_to_store(self):
+        app = BrowserGuiApp()
+        app.base_config = Config(args=None, config_file=self.config_path)
+
+        with patch("github_crawler.gui.delete_session", return_value=os.path.join(self.test_dir, "session.zip")) as delete_session_mock:
+            response = app.delete_session({"session_id": "session-1", "persist_archive": True})
+
+        delete_session_mock.assert_called_once_with(app.base_config.output_dir, "session-1", persist_archive=True)
+        self.assertIn("archived it to", response["message"])
 
 
 if __name__ == "__main__":
-	unittest.main()
-
+    unittest.main()

@@ -1,7 +1,7 @@
 import os
 import yaml
 import json
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from InquirerPy import inquirer
 
 DEFAULT_CONFIG_PATH = os.path.expanduser("~/.gh-crawler.yaml")
@@ -52,45 +52,65 @@ class Config:
         self.config_file = os.path.expanduser(config_file)
         saved_config = load_yaml_config(self.config_file)
 
-        self.github_token = (args.github_token if args else None) or os.environ.get("GITHUB_TOKEN") or saved_config.get("github_token")
-        self.keywords = (args.keywords if args else None) or os.environ.get("KEYWORDS") or saved_config.get("keywords", "")
-        self.language = (args.language if args else None) or os.environ.get("LANGUAGE") or saved_config.get("language", "python")
+        self.github_token = (getattr(args, "github_token", None) if args else None) or os.environ.get("GITHUB_TOKEN") or saved_config.get("github_token")
+        self.keywords = (getattr(args, "keywords", None) if args else None) or os.environ.get("KEYWORDS") or saved_config.get("keywords")
+        labels_value = (getattr(args, "labels", None) if args else None) or os.environ.get("LABELS") or saved_config.get("labels")
+        self.labels = self._coerce_labels(labels_value)
+        self.language = (getattr(args, "language", None) if args else None) or os.environ.get("LANGUAGE") or saved_config.get("language")
+        self.min_stars = self._coerce_int(
+            getattr(args, "min_stars", None) if args else None,
+            os.environ.get("MIN_STARS"),
+            saved_config.get("min_stars"),
+            field_name="min_stars",
+        )
+        self.min_forks = self._coerce_int(
+            getattr(args, "min_forks", None) if args else None,
+            os.environ.get("MIN_FORKS"),
+            saved_config.get("min_forks"),
+            field_name="min_forks",
+        )
+        self.license = (getattr(args, "license", None) if args else None) or os.environ.get("LICENSE") or saved_config.get("license")
+        self.limit = self._coerce_int(
+            getattr(args, "limit", None) if args else None,
+            os.environ.get("LIMIT"),
+            saved_config.get("limit"),
+            field_name="limit",
+        )
 
-        try:
-            min_stars_arg = args.min_stars if args else None
-            min_stars_value = min_stars_arg if min_stars_arg is not None else os.environ.get("MIN_STARS", saved_config.get("min_stars", 100))
-            self.min_stars = int(min_stars_value)
-        except (ValueError, TypeError):
-            self.min_stars = 100
-
-        try:
-            min_forks_arg = args.min_forks if args else None
-            min_forks_value = min_forks_arg if min_forks_arg is not None else os.environ.get("MIN_FORKS", saved_config.get("min_forks", 0))
-            self.min_forks = int(min_forks_value)
-        except (ValueError, TypeError):
-            self.min_forks = 0
-            
-        self.license = (args.license if args else None) or os.environ.get("LICENSE") or saved_config.get("license", "")
-
-        try:
-            limit_arg = args.limit if args else None
-            limit_value = limit_arg if limit_arg is not None else os.environ.get("LIMIT", saved_config.get("limit", 10))
-            self.limit = int(limit_value)
-        except (ValueError, TypeError):
-            self.limit = 10
-
-        self.output_dir = os.environ.get("OUTPUT_DIR") or saved_config.get("output_dir", "./output")
-        self.temp_dir = os.environ.get("TEMP_DIR") or saved_config.get("temp_dir", "/tmp/gh-crawler")
-        self.save_background_report = args.run_background if args else saved_config.get("save_background_report", True)
+        self.output_dir = os.environ.get("OUTPUT_DIR") or saved_config.get("output_dir")
+        self.temp_dir = os.environ.get("TEMP_DIR") or saved_config.get("temp_dir")
+        self.save_background_report = getattr(args, "run_background", None) if args else saved_config.get("save_background_report")
 
         # Ensure dirs exist
-        os.makedirs(self.output_dir, exist_ok=True)
-        os.makedirs(self.temp_dir, exist_ok=True)
+        if self.output_dir:
+            os.makedirs(self.output_dir, exist_ok=True)
+        if self.temp_dir:
+            os.makedirs(self.temp_dir, exist_ok=True)
+
+    @staticmethod
+    def _coerce_int(*candidates, field_name: str) -> Optional[int]:
+        for candidate in candidates:
+            if candidate in (None, ""):
+                continue
+            try:
+                return int(candidate)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{field_name} must be an integer.") from exc
+        return None
+
+    @staticmethod
+    def _coerce_labels(value: Any) -> list[str]:
+        if value in (None, ""):
+            return []
+        if isinstance(value, list):
+            return [str(item).strip() for item in value if str(item).strip()]
+        return [part.strip() for part in str(value).split(",") if part.strip()]
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "github_token": self.github_token,
             "keywords": self.keywords,
+            "labels": self.labels,
             "language": self.language,
             "min_stars": self.min_stars,
             "min_forks": self.min_forks,
@@ -105,7 +125,7 @@ class Config:
         save_config(self.to_dict(), self.config_file)
 
     def is_complete(self) -> bool:
-        return bool(self.github_token and self.keywords)
+        return bool(self.github_token and self.keywords and self.output_dir and self.temp_dir)
 
     def prompt_for_missing_values(self):
         # GitHub Token
@@ -124,25 +144,25 @@ class Config:
             message="Programming Language (leave blank for all):",
             default=self.language or ""
         ).execute()
+
+        labels_str = inquirer.text(
+            message="Labels / Topics (comma-separated):",
+            default=", ".join(self.labels)
+        ).execute()
+        self.labels = self._coerce_labels(labels_str)
         
         # Numeric values
         min_stars_str = inquirer.text(
             message="Minimum Stars:",
-            default=str(self.min_stars)
+            default="" if self.min_stars is None else str(self.min_stars)
         ).execute()
-        try:
-            self.min_stars = int(min_stars_str)
-        except ValueError:
-            self.min_stars = 100
+        self.min_stars = None if min_stars_str == "" else int(min_stars_str)
 
         min_forks_str = inquirer.text(
             message="Minimum Forks:",
-            default=str(self.min_forks)
+            default="" if self.min_forks is None else str(self.min_forks)
         ).execute()
-        try:
-            self.min_forks = int(min_forks_str)
-        except ValueError:
-            self.min_forks = 0
+        self.min_forks = None if min_forks_str == "" else int(min_forks_str)
 
         self.license = inquirer.text(
             message="License (e.g. mit, apache-2.0):",
@@ -151,25 +171,28 @@ class Config:
 
         # Limits and Output
         limit_str = inquirer.text(
-            message="Maximum repositories to process:",
-            default=str(self.limit)
+            message="Maximum repositories to process (leave blank for no limit):",
+            default="" if self.limit is None else str(self.limit)
         ).execute()
-        try:
-            self.limit = int(limit_str)
-        except ValueError:
-            self.limit = 10
+        self.limit = None if limit_str == "" else int(limit_str)
 
         self.output_dir = inquirer.text(
             message="Output Directory:",
-            default=self.output_dir
+            default=self.output_dir or ""
+        ).execute()
+
+        self.temp_dir = inquirer.text(
+            message="Temporary Directory:",
+            default=self.temp_dir or ""
         ).execute()
         
         self.save_background_report = inquirer.confirm(
             message="Save background report?",
-            default=self.save_background_report
+            default=bool(self.save_background_report)
         ).execute()
 
-        os.makedirs(self.output_dir, exist_ok=True)
-        os.makedirs(self.temp_dir, exist_ok=True)
+        if self.output_dir:
+            os.makedirs(self.output_dir, exist_ok=True)
+        if self.temp_dir:
+            os.makedirs(self.temp_dir, exist_ok=True)
         self.save()
-

@@ -1,10 +1,11 @@
 import json
-import re
-from google import genai
-import openai
 from abc import ABC, abstractmethod
-from typing import Dict, Any, Optional, List
+from typing import Any, Dict, List, Optional
+
+import openai
 from github import Github
+from google import genai
+
 from github_crawler.events import EventType, event_bus
 
 class AIProvider(ABC):
@@ -27,6 +28,7 @@ class GoogleAIProvider(AIProvider):
         text = response.text.strip()
         
         # More robust JSON extraction using regex
+        import re
         json_match = re.search(r'```json\s*(.*?)\s*```', text, re.DOTALL)
         if json_match:
             return json_match.group(1).strip()
@@ -67,7 +69,7 @@ class SearchSynthesizer:
         if not self.provider:
             return {
                 "keywords": deep_query,
-                "reasoning": "No AI provider configured for synthesis."
+                "reasoning": "No AI provider configured for synthesis; using the repository request verbatim.",
             }
 
         prompt = f"""
@@ -100,22 +102,28 @@ class SearchSynthesizer:
         try:
             text = self.provider.synthesize(prompt)
             if not text or text.strip() == "":
-                return {"keywords": deep_query, "reasoning": "Provider returned empty response."}
-            return json.loads(text)
+                raise ValueError("Provider returned empty response.")
+            payload = json.loads(text)
+            if not isinstance(payload, dict):
+                raise ValueError("Provider returned non-object JSON.")
+            if not payload.get("keywords"):
+                raise ValueError("Provider response did not include keywords.")
+            return payload
         except Exception as e:
-            return {
-                "keywords": deep_query,
-                "reasoning": f"Synthesis error via {self.provider.__class__.__name__}: {str(e)}"
-            }
+            raise ValueError(
+                f"Synthesis error via {self.provider.__class__.__name__}: {str(e)}"
+            )
 
 class GitHubSearcher:
     def __init__(self, token: str):
         self.gh = Github(token, timeout=15)
 
-    def search_repositories(self, keywords: str, language: Optional[str] = None, 
+    def search_repositories(self, keywords: str, labels: Optional[List[str]] = None, language: Optional[str] = None,
                             min_stars: Optional[int] = None, min_forks: Optional[int] = None,
-                            license: Optional[str] = None, limit: int = 10) -> List[Any]:
+                            license: Optional[str] = None, limit: Optional[int] = None) -> List[Any]:
         query = keywords
+        for label in labels or []:
+            query += f" topic:{label}"
         if language:
             query += f" language:{language}"
         if min_stars:
@@ -131,7 +139,7 @@ class GitHubSearcher:
         results = []
         try:
             for i, repo in enumerate(repositories):
-                if i >= limit:
+                if limit is not None and i >= limit:
                     break
                 results.append(repo)
                 event_bus.emit(EventType.LOG, f"Found repository: {repo.full_name}")

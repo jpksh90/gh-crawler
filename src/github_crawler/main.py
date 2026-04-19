@@ -1,5 +1,4 @@
 import os
-import shutil
 import time
 from datetime import datetime
 
@@ -8,21 +7,72 @@ from rich.console import Console
 
 from github_crawler.events import EventType, event_bus
 from github_crawler.reporting import generate_markdown_report, display_results_table, save_background_report
-from github_crawler.search import GitHubSearcher
+from github_crawler.search import GitHubSearcher, SearchSynthesizer
 from github_crawler.config import Config
 from github_crawler.ui_handler import RichUIHandler
 from github_crawler.cli import parse_args, explore_repo_files
-from github_crawler.agent import CodeAgent
+from github_crawler.source_scan import SourcePropertyScanner
 from github_crawler.github_utils import clone_repo, count_lines_of_code
+from github_crawler.session_store import create_session, delete_session, list_sessions, update_session_metadata
 from InquirerPy import inquirer
 from InquirerPy.base.control import Choice
+from rich.table import Table
 
 console = Console()
 
 MAX_RETRIES = 3
 RETRY_DELAY = 5 # seconds
 
-def search_repositories(config: Config):
+def synthesize_scan_spec(config: Config, task: str):
+    synthesizer = SearchSynthesizer(
+        google_key=os.environ.get("GOOGLE_API_KEY"),
+        openai_key=os.environ.get("OPENAI_API_KEY"),
+    )
+    event_bus.emit(EventType.SYNTHESIS_STARTED)
+    synthesis_data = synthesizer.synthesize(config.keywords)
+    search_spec = {
+        "repository_request": config.keywords,
+        "keywords": synthesis_data["keywords"],
+        "labels": synthesis_data.get("labels", []),
+        "language": synthesis_data.get("language", config.language),
+        "min_stars": synthesis_data.get("min_stars")
+        if synthesis_data.get("min_stars") is not None
+        else config.min_stars,
+        "min_forks": synthesis_data.get("min_forks")
+        if synthesis_data.get("min_forks") is not None
+        else config.min_forks,
+        "license": synthesis_data.get("license") or config.license,
+        "reasoning": synthesis_data.get("reasoning", ""),
+        "property_query": task,
+    }
+    event_bus.emit(EventType.SYNTHESIS_FINISHED, search_spec)
+    return search_spec
+
+
+def build_prompted_search_spec(config: Config, task: str):
+    return {
+        "repository_request": config.keywords,
+        "keywords": config.keywords,
+        "labels": list(config.labels),
+        "language": config.language,
+        "min_stars": config.min_stars,
+        "min_forks": config.min_forks,
+        "license": config.license,
+        "reasoning": "Using search criteria entered directly in the terminal interface.",
+        "property_query": task,
+    }
+
+
+def resolve_task(task: str | None) -> str:
+    if task and task.strip():
+        return task.strip()
+    return inquirer.text(
+        message="Source Property Request:",
+        default="",
+    ).execute().strip()
+
+
+def search_repositories(config: Config, search_spec):
     """
     Searches for repositories based on the provided configuration.
     Emits search events and returns a list of repository objects.
@@ -33,11 +83,12 @@ def search_repositories(config: Config):
     for attempt in range(MAX_RETRIES):
         try:
             repos = searcher.search_repositories(
-                keywords=config.keywords,
-                language=config.language,
-                min_stars=config.min_stars,
-                min_forks=config.min_forks,
-                license=config.license,
+                keywords=search_spec["keywords"],
+                labels=search_spec.get("labels"),
+                language=search_spec["language"],
+                min_stars=search_spec["min_stars"],
+                min_forks=search_spec["min_forks"],
+                license=search_spec["license"],
                 limit=config.limit
             )
             event_bus.emit(EventType.SEARCH_SUCCESS, len(repos))
@@ -80,41 +131,29 @@ def search_repositories(config: Config):
     return []
 
 
-def process_repository(repo, config: Config, temp_dir: str, task: str = "Analyze repository structure"):
+def process_repository(repo, session, task: str):
     """
     Processes a single repository: clones, analyzes, and reports.
     Emits repo-specific events.
     """
     repo_name = repo.full_name
+    clone_dir = session.repo_clone_dir(repo_name)
     event_bus.emit(EventType.REPO_START, repo_name)
 
     try:
-        # Clone repository
-        shutil.rmtree(temp_dir, ignore_errors=True) # Clean up previous clone
-        os.makedirs(temp_dir, exist_ok=True)
-        
         # Use shared utility for cloning to keep clone behavior centralized.
         event_bus.emit(EventType.LOG, f"{repo_name}: cloning repository")
-        clone_repo(repo.clone_url, temp_dir)
+        clone_repo(repo.clone_url, clone_dir)
         event_bus.emit(EventType.LOG, f"{repo_name}: clone complete")
 
-        # Use CodeAgent for analysis
-        event_bus.emit(EventType.LOG, f"{repo_name}: starting analysis")
-        agent = CodeAgent(
-            repo_name=repo_name, 
-            repo_path=temp_dir, 
-            google_key=os.environ.get("GOOGLE_API_KEY"), 
-            openai_key=os.environ.get("OPENAI_API_KEY")
-        )
-        
-        analysis = agent.run_session(task=task, silent=True)
-        trace = agent.trace
-        files_touched = list(agent.files_touched)
-        event_bus.emit(EventType.LOG, f"{repo_name}: analysis complete")
+        event_bus.emit(EventType.LOG, f"{repo_name}: scanning source properties")
+        scanner = SourcePropertyScanner(repo_name=repo_name, repo_path=clone_dir)
+        analysis_result = scanner.scan(task)
+        event_bus.emit(EventType.LOG, f"{repo_name}: source scan complete")
 
         # Count lines with the shared pygount-backed utility.
         event_bus.emit(EventType.LOG, f"{repo_name}: counting lines of code")
-        lines_of_code = count_lines_of_code(temp_dir)
+        lines_of_code = count_lines_of_code(clone_dir)
         event_bus.emit(EventType.LOG, f"{repo_name}: counted {lines_of_code:,} lines of code")
 
         result = {
@@ -123,9 +162,11 @@ def process_repository(repo, config: Config, temp_dir: str, task: str = "Analyze
             "stars": repo.stargazers_count,
             "language": repo.language,
             "lines_of_code": lines_of_code,
-            "analysis": analysis,
-            "trace": trace,
-            "files_touched": files_touched
+            "analysis": analysis_result["summary"],
+            "trace": analysis_result["trace"],
+            "files_touched": analysis_result["files_touched"],
+            "property_matches": analysis_result["findings"],
+            "clone_path": clone_dir,
         }
 
         event_bus.emit(EventType.REPO_SUCCESS, repo_name)
@@ -164,30 +205,19 @@ def process_repository(repo, config: Config, temp_dir: str, task: str = "Analyze
         # Handle any other unexpected errors during repository processing
         event_bus.emit(EventType.REPO_ERROR, (repo_name, str(e)))
         return None
-    finally:
-        # Clean up cloned repo
-        shutil.rmtree(temp_dir, ignore_errors=True)
 
 
-def emit_synthesis_events(config: Config):
-    event_bus.emit(EventType.SYNTHESIS_STARTED)
-    synthesis_data = {
-        "keywords": config.keywords,
-        "language": config.language,
-        "min_stars": config.min_stars,
-        "reasoning": "Searching for popular Python repositories based on keywords."
+def save_scan_outputs(all_results, config: Config, task: str, session, save_reports: bool = True):
+    artifacts = {
+        "session_id": session.session_id,
+        "session_dir": session.session_dir,
     }
-    event_bus.emit(EventType.SYNTHESIS_FINISHED, synthesis_data)
-
-
-def save_scan_outputs(all_results, config: Config, task: str, save_reports: bool = True):
-    artifacts = {}
     if not save_reports or not all_results:
         return artifacts
 
     markdown_report = generate_markdown_report(all_results, task)
     report_filename = f"report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
-    report_filepath = os.path.join(config.output_dir, report_filename)
+    report_filepath = os.path.join(session.artifact_dir, report_filename)
     try:
         with open(report_filepath, "w", encoding="utf-8") as f:
             f.write(markdown_report)
@@ -198,7 +228,7 @@ def save_scan_outputs(all_results, config: Config, task: str, save_reports: bool
 
     if config.save_background_report:
         background_report_filename = f"background_scan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-        background_report_filepath = os.path.join(config.output_dir, background_report_filename)
+        background_report_filepath = os.path.join(session.artifact_dir, background_report_filename)
         if save_background_report(all_results, task, background_report_filepath):
             artifacts["background_report"] = background_report_filepath
             event_bus.emit(EventType.LOG, f"Background scan report saved to: {background_report_filepath}")
@@ -208,7 +238,7 @@ def save_scan_outputs(all_results, config: Config, task: str, save_reports: bool
     return artifacts
 
 
-def run_interactive_exploration(all_results, repos_to_process, config: Config):
+def run_interactive_exploration(all_results):
     while True:
         choices = [Choice(res['name'], name=res['name']) for res in all_results]
         choices.append(Choice(value="quit", name="[Quit]"))
@@ -221,46 +251,54 @@ def run_interactive_exploration(all_results, repos_to_process, config: Config):
         if selected_repo_name == "quit":
             break
 
-        last_repo_name = all_results[-1]['name']
-        if selected_repo_name == last_repo_name:
-            explore_repo_files(os.path.join(config.temp_dir, "repo_clone"))
-        else:
-            console.print(f"[yellow]Note: Re-cloning {selected_repo_name} for exploration...[/yellow]")
-            temp_explore_dir = os.path.join(config.temp_dir, "explore")
-            shutil.rmtree(temp_explore_dir, ignore_errors=True)
-            os.makedirs(temp_explore_dir, exist_ok=True)
-
-            repo_obj = next(r for r in repos_to_process if r.full_name == selected_repo_name)
-            clone_repo(repo_obj.clone_url, temp_explore_dir)
-            explore_repo_files(temp_explore_dir)
+        selected_result = next(result for result in all_results if result["name"] == selected_repo_name)
+        explore_repo_files(selected_result["clone_path"])
 
 
-def run_crawler(config: Config, task: str = "Analyze repository structure", interactive: bool = False,
-                render_console: bool = True, save_reports: bool = True):
+def run_crawler(config: Config, task: str, interactive: bool = False,
+                render_console: bool = True, save_reports: bool = True, use_synthesis: bool = True):
     if not config.github_token:
         event_bus.emit(EventType.ERROR, "GitHub token not found. Please set it in config or environment.")
         return [], {}
+    if not config.keywords:
+        event_bus.emit(EventType.ERROR, "Repository request not found. Please provide search keywords.")
+        return [], {}
+    if not config.output_dir or not config.temp_dir:
+        event_bus.emit(EventType.ERROR, "Output and temporary directories must be provided explicitly.")
+        return [], {}
+    if not task.strip():
+        event_bus.emit(EventType.ERROR, "Source property request must be provided explicitly.")
+        return [], {}
 
-    emit_synthesis_events(config)
+    session = create_session(config.output_dir, config.keywords, task)
+    event_bus.emit(EventType.LOG, f"Session workspace created at {session.session_dir}")
+    search_spec = synthesize_scan_spec(config, task) if use_synthesis else build_prompted_search_spec(config, task)
+    update_session_metadata(
+        session,
+        {
+            "status": "running",
+            "search_spec": search_spec,
+        },
+    )
 
     # Search for repositories
-    repos_to_process = search_repositories(config)
+    repos_to_process = search_repositories(config, search_spec)
 
     if not repos_to_process:
         no_results_message = "No repositories found matching the criteria."
+        update_session_metadata(session, {"status": "empty"})
         if render_console:
             console.print(f"[yellow]{no_results_message}[/yellow]")
         else:
             event_bus.emit(EventType.LOG, no_results_message)
-        return [], {}
+        return [], {"session_id": session.session_id, "session_dir": session.session_dir}
 
     event_bus.emit(EventType.PROCESSING_STARTED)
     all_results = []
-    temp_repo_dir = os.path.join(config.temp_dir, "repo_clone")
     event_bus.emit(EventType.LOG, f"Preparing to process {len(repos_to_process)} repositories")
 
     for repo in repos_to_process:
-        result = process_repository(repo, config, temp_repo_dir, task)
+        result = process_repository(repo, session, task)
         if result:
             all_results.append(result)
 
@@ -269,12 +307,64 @@ def run_crawler(config: Config, task: str = "Analyze repository structure", inte
     if render_console and all_results:
         display_results_table(all_results)
 
-    artifacts = save_scan_outputs(all_results, config, task, save_reports=save_reports)
+    artifacts = save_scan_outputs(all_results, config, task, session, save_reports=save_reports)
+    update_session_metadata(
+        session,
+        {
+            "status": "complete",
+            "repositories": [
+                {
+                    "name": result["name"],
+                    "url": result["url"],
+                    "clone_path": result["clone_path"],
+                    "matches": len(result.get("property_matches", [])),
+                }
+                for result in all_results
+            ],
+            "artifacts": artifacts,
+            "result_count": len(all_results),
+        },
+    )
 
     if interactive and all_results:
-        run_interactive_exploration(all_results, repos_to_process, config)
+        run_interactive_exploration(all_results)
 
     return all_results, artifacts
+
+
+def print_sessions(output_dir: str):
+    sessions = list_sessions(output_dir)
+    if not sessions:
+        console.print("[yellow]No persisted sessions found.[/yellow]")
+        return
+
+    table = Table(title="Persisted Sessions", show_header=True, header_style="bold cyan")
+    table.add_column("Session ID")
+    table.add_column("Status")
+    table.add_column("Repositories", justify="right")
+    table.add_column("Created")
+    table.add_column("Request")
+    for session in sessions:
+        table.add_row(
+            session.get("session_id", ""),
+            session.get("status", ""),
+            str(session.get("result_count", 0)),
+            session.get("created_at", ""),
+            session.get("repository_request", ""),
+        )
+    console.print(table)
+
+
+def delete_session_with_prompt(output_dir: str, session_id: str):
+    persist_archive = inquirer.confirm(
+        message="Persist this session as a zip archive before deleting it?",
+        default=True,
+    ).execute()
+    archive_path = delete_session(output_dir, session_id, persist_archive=persist_archive)
+    if archive_path:
+        console.print(f"[green]Deleted session {session_id} and archived it to {archive_path}[/green]")
+        return
+    console.print(f"[green]Deleted session {session_id}[/green]")
 
 
 def run_gui_mode():
@@ -294,15 +384,34 @@ def main(argv=None):
 
     config = Config(args)
 
-    if not config.is_complete():
-        config.prompt_for_missing_values()
+    if args.list_sessions:
+        if not config.output_dir:
+            console.print("[red]Output directory must be configured to list sessions.[/red]")
+            return
+        print_sessions(config.output_dir)
+        return
+
+    if args.delete_session:
+        if not config.output_dir:
+            console.print("[red]Output directory must be configured to delete sessions.[/red]")
+            return
+        delete_session_with_prompt(config.output_dir, args.delete_session)
+        return
+
+    config.prompt_for_missing_values()
+
+    task = resolve_task(args.task)
+    if not task:
+        console.print("[red]Source property request is required.[/red]")
+        return
 
     run_crawler(
         config=config,
-        task=args.task or "Analyze repository structure",
+        task=task,
         interactive=args.interactive,
         render_console=True,
         save_reports=True,
+        use_synthesis=False,
     )
 
 

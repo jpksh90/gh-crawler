@@ -14,13 +14,23 @@ def generate_markdown_report(results, task):
         md += f"- **Stars:** {res['stars']}" + "\n"
         md += f"- **Language:** {res['language']}" + "\n"
         md += f"- **Lines of Code:** {res.get('lines_of_code', 0):,}" + "\n"
-        md += f"- **Agent Analysis:** {res['analysis']}" + "\n"
-        
+        md += f"- **Clone Path:** `{res.get('clone_path', 'n/a')}`" + "\n"
+        md += f"- **Analysis Summary:** {res['analysis']}" + "\n"
+         
         if res['trace']:
             md += "\n### Trace Log:\n"
             for t in res['trace']:
                 md += f"- **Turn {t['turn']}**: Thought: {t['thought']} | Output: ```\n{t['output'][:200]}...\n```\n" # Truncate output for brevity
-        
+
+        if res.get("property_matches"):
+            md += "\n### Property Matches:\n"
+            for match in res["property_matches"][:10]:
+                md += (
+                    f"- `{match['file_path']}:{match['line_number']}` "
+                    f"({match['match_type']}: `{match['pattern']}`)\n"
+                    f"  ```text\n{match['snippet']}\n```\n"
+                )
+         
         if res['files_touched']:
             md += "\n### Files Touched:\n"
             for f in sorted(res["files_touched"]):
@@ -33,7 +43,7 @@ def display_results_table(results):
     table.add_column("ID", style="dim")
     table.add_column("Repository", style="cyan")
     table.add_column("Lines", style="green")
-    table.add_column("Agent Analysis", style="italic")
+    table.add_column("Findings", style="italic")
 
     for i, res in enumerate(results):
         table.add_row(str(i+1), res["name"], f"{res.get('lines_of_code', 0):,}", res["analysis"])

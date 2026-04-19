@@ -12,7 +12,8 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="GitHub Repository Crawler and Analyzer")
 
     # Search Criteria Arguments
-    parser.add_argument("--keywords", type=str, help="Keywords to search for repositories.")
+    parser.add_argument("--keywords", type=str, help="Natural-language repository request used to find relevant projects.")
+    parser.add_argument("--labels", type=str, help="Comma-separated repository topics or labels to search for.")
     parser.add_argument("--language", type=str, help="Filter by programming language.")
     parser.add_argument("--min-stars", type=int, help="Minimum number of stars a repository must have.")
     parser.add_argument("--min-forks", type=int, help="Minimum number of forks a repository must have.")
@@ -21,11 +22,13 @@ def parse_args(argv=None):
     parser.add_argument("--pushed-after", type=str, help="Filter repositories last pushed after a specific date (YYYY-MM-DD).")
     
     # Task and Limit Arguments
-    parser.add_argument("--task", type=str, help="The specific analysis task to perform on cloned repositories.")
+    parser.add_argument("--task", type=str, help="Natural-language source property request to inspect inside cloned repositories.")
     parser.add_argument("--limit", type=int, help="Maximum number of repositories to process.")
     parser.add_argument("--run-background", action="store_true", help="Run analysis in the background and save output to a file.")
     parser.add_argument("--interactive", action="store_true", help="Interactively explore repositories after scanning.")
     parser.add_argument("-g", "--gui", action="store_true", help="Launch the graphical interface instead of the terminal UI.")
+    parser.add_argument("--list-sessions", action="store_true", help="List persisted crawler sessions.")
+    parser.add_argument("--delete-session", type=str, help="Delete a persisted crawler session by ID.")
 
     # API Key Arguments
     parser.add_argument("--github-token", type=str, help="GitHub API token.")
