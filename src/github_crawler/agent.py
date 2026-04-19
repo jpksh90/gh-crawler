@@ -3,6 +3,8 @@ import subprocess
 from rich.console import Console
 from rich.panel import Panel
 
+from github_crawler.events import EventType, event_bus
+
 console = Console()
 
 class CodeAgent:
@@ -18,11 +20,13 @@ class CodeAgent:
     def run_session(self, task: str, silent: bool = False):
         self.current_task = task
         self.trace.append({"turn": 1, "thought": "Initial thought process for the task.", "output": "Starting analysis..."})
-        
+        event_bus.emit(EventType.LOG, f"{self.repo_name}: agent session started")
+
         # Placeholder for actual analysis logic
         analysis_result = f"Analysis of '{self.repo_name}' for task: '{task}'. Initial step completed."
         self.trace.append({"turn": 1, "thought": "Completed initial analysis step.", "output": analysis_result})
-        
+        event_bus.emit(EventType.LOG, f"{self.repo_name}: agent produced an initial analysis result")
+
         if not silent:
             console.print(Panel(f"[bold cyan]Agent analyzing:[/bold cyan] {self.repo_name}\nTask: {task}\nResult: {analysis_result}"))
         

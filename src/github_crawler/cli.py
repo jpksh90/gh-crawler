@@ -8,7 +8,7 @@ from rich.syntax import Syntax
 
 console = Console()
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="GitHub Repository Crawler and Analyzer")
 
     # Search Criteria Arguments
@@ -25,13 +25,14 @@ def parse_args():
     parser.add_argument("--limit", type=int, help="Maximum number of repositories to process.")
     parser.add_argument("--run-background", action="store_true", help="Run analysis in the background and save output to a file.")
     parser.add_argument("--interactive", action="store_true", help="Interactively explore repositories after scanning.")
-    
+    parser.add_argument("-g", "--gui", action="store_true", help="Launch the graphical interface instead of the terminal UI.")
+
     # API Key Arguments
     parser.add_argument("--github-token", type=str, help="GitHub API token.")
     parser.add_argument("--google-api-key", type=str, help="Google API Key.")
     parser.add_argument("--openai-api-key", type=str, help="OpenAI API Key.")
 
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 def explore_repo_files(repo_path: str):
     """

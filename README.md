@@ -10,7 +10,7 @@ A GitHub repository crawler and AI-powered code analysis agent. Search across re
 - **Interactive Deep-Dive:** Browse step-by-step reasoning logs and full execution traces after a scan.
 - **Visual Exploration Tree:** See a visual hierarchy of every file the agent touched during its analysis.
 - **Automated Reporting:** Generate comprehensive Markdown reports of your search findings and agent analysis.
-- **Secure Persistence:** Store your GitHub and Google API keys securely in `~/.gh-crawler.json`.
+- **Secure Persistence:** Store your GitHub crawler settings locally in `~/.gh-crawler.yaml`.
 
 ## 🛠️ Installation
 
@@ -28,6 +28,12 @@ Launch the interactive CLI by simply running:
 gh-crawler
 ```
 
+Launch the browser-based GUI alternative with:
+
+```bash
+gh-crawler -g
+```
+
 ### ⌨️ Interactive Menu Actions:
 - `deep`: Inspect the full reasoning log and tool outputs for a specific repository.
 - `tree`: Display a visual tree of files analyzed by the AI agent.
@@ -42,7 +48,7 @@ The tool will prompt you for the following keys on its first run if they are not
 - `GITHUB_TOKEN`: Personal Access Token for GitHub API (recommended to avoid rate limits).
 - `GOOGLE_API_KEY`: API Key for Google Gemini (Gemini 1.5 Flash).
 
-These are stored locally in `~/.gh-crawler.json`.
+These are stored locally in `~/.gh-crawler.yaml`.
 
 ## 📂 Project Structure
 

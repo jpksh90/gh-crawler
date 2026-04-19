@@ -94,9 +94,12 @@ def process_repository(repo, config: Config, temp_dir: str, task: str = "Analyze
         os.makedirs(temp_dir, exist_ok=True)
         
         # Use shared utility for cloning to keep clone behavior centralized.
+        event_bus.emit(EventType.LOG, f"{repo_name}: cloning repository")
         clone_repo(repo.clone_url, temp_dir)
+        event_bus.emit(EventType.LOG, f"{repo_name}: clone complete")
 
         # Use CodeAgent for analysis
+        event_bus.emit(EventType.LOG, f"{repo_name}: starting analysis")
         agent = CodeAgent(
             repo_name=repo_name, 
             repo_path=temp_dir, 
@@ -107,9 +110,12 @@ def process_repository(repo, config: Config, temp_dir: str, task: str = "Analyze
         analysis = agent.run_session(task=task, silent=True)
         trace = agent.trace
         files_touched = list(agent.files_touched)
+        event_bus.emit(EventType.LOG, f"{repo_name}: analysis complete")
 
         # Count lines with the shared pygount-backed utility.
+        event_bus.emit(EventType.LOG, f"{repo_name}: counting lines of code")
         lines_of_code = count_lines_of_code(temp_dir)
+        event_bus.emit(EventType.LOG, f"{repo_name}: counted {lines_of_code:,} lines of code")
 
         result = {
             "name": repo_name,
@@ -163,24 +169,8 @@ def process_repository(repo, config: Config, temp_dir: str, task: str = "Analyze
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
-def main():
-    """Main function to orchestrate the GitHub crawler."""
-    args = parse_args()
-    RichUIHandler() # Initialize UI Handler
-
-    config = Config(args)
-    
-    # If config is not fully set, prompt user
-    if not config.is_complete():
-        config.prompt_for_missing_values()
-        
-    # Ensure GitHub token is set
-    if not config.github_token:
-        console.print("[bold red]Error:[/bold red] GitHub token not found. Please set it in config or environment.")
-        return
-
+def emit_synthesis_events(config: Config):
     event_bus.emit(EventType.SYNTHESIS_STARTED)
-    # Placeholder for synthesis logic
     synthesis_data = {
         "keywords": config.keywords,
         "language": config.language,
@@ -189,119 +179,131 @@ def main():
     }
     event_bus.emit(EventType.SYNTHESIS_FINISHED, synthesis_data)
 
+
+def save_scan_outputs(all_results, config: Config, task: str, save_reports: bool = True):
+    artifacts = {}
+    if not save_reports or not all_results:
+        return artifacts
+
+    markdown_report = generate_markdown_report(all_results, task)
+    report_filename = f"report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
+    report_filepath = os.path.join(config.output_dir, report_filename)
+    try:
+        with open(report_filepath, "w", encoding="utf-8") as f:
+            f.write(markdown_report)
+        artifacts["markdown_report"] = report_filepath
+        event_bus.emit(EventType.LOG, f"Markdown report saved to: {report_filepath}")
+    except Exception as e:
+        event_bus.emit(EventType.ERROR, f"Error saving markdown report: {e}")
+
+    if config.save_background_report:
+        background_report_filename = f"background_scan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        background_report_filepath = os.path.join(config.output_dir, background_report_filename)
+        if save_background_report(all_results, task, background_report_filepath):
+            artifacts["background_report"] = background_report_filepath
+            event_bus.emit(EventType.LOG, f"Background scan report saved to: {background_report_filepath}")
+        else:
+            event_bus.emit(EventType.ERROR, "Error saving background scan report.")
+
+    return artifacts
+
+
+def run_interactive_exploration(all_results, repos_to_process, config: Config):
+    while True:
+        choices = [Choice(res['name'], name=res['name']) for res in all_results]
+        choices.append(Choice(value="quit", name="[Quit]"))
+
+        selected_repo_name = inquirer.select(
+            message="Select a repository to explore interactively:",
+            choices=choices
+        ).execute()
+
+        if selected_repo_name == "quit":
+            break
+
+        last_repo_name = all_results[-1]['name']
+        if selected_repo_name == last_repo_name:
+            explore_repo_files(os.path.join(config.temp_dir, "repo_clone"))
+        else:
+            console.print(f"[yellow]Note: Re-cloning {selected_repo_name} for exploration...[/yellow]")
+            temp_explore_dir = os.path.join(config.temp_dir, "explore")
+            shutil.rmtree(temp_explore_dir, ignore_errors=True)
+            os.makedirs(temp_explore_dir, exist_ok=True)
+
+            repo_obj = next(r for r in repos_to_process if r.full_name == selected_repo_name)
+            clone_repo(repo_obj.clone_url, temp_explore_dir)
+            explore_repo_files(temp_explore_dir)
+
+
+def run_crawler(config: Config, task: str = "Analyze repository structure", interactive: bool = False,
+                render_console: bool = True, save_reports: bool = True):
+    if not config.github_token:
+        event_bus.emit(EventType.ERROR, "GitHub token not found. Please set it in config or environment.")
+        return [], {}
+
+    emit_synthesis_events(config)
+
     # Search for repositories
     repos_to_process = search_repositories(config)
 
-    # Check if search returned any repos and handle no-results/errors from search
     if not repos_to_process:
-        # If search_repositories returned an empty list, it might have already emitted
-        # an error event (e.g., rate limit, API error). If not, we can emit a generic
-        # message indicating no results or search failure.
-        # This logic assumes that if repos_to_process is empty, it's either due to
-        # an error already handled or genuinely no results found.
-        # We avoid double-emitting errors here.
-        # The check `any(e['type'] == EventType.ERROR for e in ui_handler._event_log if e['data'])`
-        # is a simplification and might not be robust as _event_log might not be accessible or populated.
-        # A more reliable approach would be to have search_repositories return a status flag or
-        # ensure errors are always emitted.
-        # For now, we'll rely on the fact that if search_repositories failed, it likely emitted an error.
-        # If it simply found no results, no specific error needs to be printed here.
-        pass # Rely on search_repositories to emit errors if it fails.
+        no_results_message = "No repositories found matching the criteria."
+        if render_console:
+            console.print(f"[yellow]{no_results_message}[/yellow]")
+        else:
+            event_bus.emit(EventType.LOG, no_results_message)
+        return [], {}
+
+    event_bus.emit(EventType.PROCESSING_STARTED)
+    all_results = []
+    temp_repo_dir = os.path.join(config.temp_dir, "repo_clone")
+    event_bus.emit(EventType.LOG, f"Preparing to process {len(repos_to_process)} repositories")
+
+    for repo in repos_to_process:
+        result = process_repository(repo, config, temp_repo_dir, task)
+        if result:
+            all_results.append(result)
+
+    event_bus.emit(EventType.PROCESSING_FINISHED)
+
+    if render_console and all_results:
+        display_results_table(all_results)
+
+    artifacts = save_scan_outputs(all_results, config, task, save_reports=save_reports)
+
+    if interactive and all_results:
+        run_interactive_exploration(all_results, repos_to_process, config)
+
+    return all_results, artifacts
 
 
-    # Processing Repositories
-    if repos_to_process: # Only proceed if we have repositories to process
-        event_bus.emit(EventType.PROCESSING_STARTED)
-        all_results = []
-        errors_encountered = [] # This list seems to be for capturing string error messages
-        
-        # Use a temporary directory for cloning each repo
-        temp_repo_dir = os.path.join(config.temp_dir, "repo_clone") 
-        task = args.task or "Analyze repository structure"
+def run_gui_mode():
+    from github_crawler.gui import launch_gui
 
-        for repo in repos_to_process:
-            result = process_repository(repo, config, temp_repo_dir, task)
-            if result:
-                all_results.append(result)
-            else:
-                # process_repository already emits structured errors via event_bus.
-                # This 'errors_encountered' list might be for capturing string errors
-                # from general Exceptions caught in process_repository, if any.
-                pass 
-        
-        event_bus.emit(EventType.PROCESSING_FINISHED)
+    launch_gui()
 
-        # Reporting
-        if all_results:
-            display_results_table(all_results)
-            markdown_report = generate_markdown_report(all_results, "Global Search")
-            
-            # Save markdown report to a file
-            report_filename = f"report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
-            report_filepath = os.path.join(config.output_dir, report_filename)
-            try:
-                with open(report_filepath, "w", encoding="utf-8") as f:
-                    f.write(markdown_report)
-                console.print(f"[green]Markdown report saved to:[/green] {report_filepath}")
-            except Exception as e:
-                console.print(f"[bold red]Error saving markdown report:[/bold red] {e}")
 
-        # If there were string errors encountered (from general Exceptions)
-        if errors_encountered:
-            # This part had syntax errors related to console.print and string formatting
-            # Corrected to use a single multiline string for console.print
-            console.print("\n[bold yellow]Encountered the following issues during processing:[/bold yellow]")
-            for err in errors_encountered:
-                console.print(f"- {err}")
+def main(argv=None):
+    """Main function to orchestrate the GitHub crawler."""
+    args = parse_args(argv)
+    if args.gui:
+        run_gui_mode()
+        return
 
-        # Optionally save background report if configured
-        if config.save_background_report:
-            background_report_filename = f"background_scan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-            background_report_filepath = os.path.join(config.output_dir, background_report_filename)
-            if save_background_report(all_results, "Global Search", background_report_filepath):
-                console.print(f"[green]Background scan report saved to:[/green] {background_report_filepath}")
-            else:
-                console.print("[bold red]Error saving background scan report.[/bold red]")
+    RichUIHandler() # Initialize UI Handler
 
-        # Interactive Exploration
-        if args.interactive and all_results:
-            while True:
-                choices = [Choice(res['name'], name=res['name']) for res in all_results]
-                choices.append(Choice(value="quit", name="[Quit]"))
-                
-                selected_repo_name = inquirer.select(
-                    message="Select a repository to explore interactively:",
-                    choices=choices
-                ).execute()
-                
-                if selected_repo_name == "quit":
-                    break
-                
-                # In this implementation, temp_repo_dir was reused. 
-                # To make this robust, we'd need to re-clone or use persistent storage.
-                # For now, we'll warn the user that only the LAST processed repo is in temp_repo_dir
-                # OR we could modify process_repository to use unique dirs.
-                
-                # Optimization: Find if the selected repo is currently in the temp_repo_dir
-                # (Since we reuse it, it's likely the last one)
-                last_repo_name = all_results[-1]['name']
-                if selected_repo_name == last_repo_name:
-                    explore_repo_files(os.path.join(config.temp_dir, "repo_clone"))
-                else:
-                    console.print(f"[yellow]Note: Re-cloning {selected_repo_name} for exploration...[/yellow]")
-                    temp_explore_dir = os.path.join(config.temp_dir, "explore")
-                    shutil.rmtree(temp_explore_dir, ignore_errors=True)
-                    os.makedirs(temp_explore_dir, exist_ok=True)
-                    
-                    repo_obj = next(r for r in repos_to_process if r.full_name == selected_repo_name)
-                    clone_repo(repo_obj.clone_url, temp_explore_dir)
-                    explore_repo_files(temp_explore_dir)
+    config = Config(args)
 
-    else: # This block handles the case where repos_to_process is empty
-        # If repos_to_process is empty, it implies either search found no results or search failed.
-        # If it succeeded but found 0 results, we should let the user know.
-        console.print("[yellow]No repositories found matching the criteria.[/yellow]")
-        pass # Rely on search_repositories to emit errors if it fails.
+    if not config.is_complete():
+        config.prompt_for_missing_values()
+
+    run_crawler(
+        config=config,
+        task=args.task or "Analyze repository structure",
+        interactive=args.interactive,
+        render_console=True,
+        save_reports=True,
+    )
 
 
 if __name__ == "__main__":
