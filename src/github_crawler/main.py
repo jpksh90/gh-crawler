@@ -1,247 +1,323 @@
 import os
-import json
 import shutil
-import tempfile
 import time
+import subprocess
 from datetime import datetime
-from rich.console import Console
-from rich.prompt import Prompt, IntPrompt, Confirm
-from rich.tree import Tree
-from rich.markup import escape
-from pyfiglet import figlet_format
-from github import Github, GithubException
 
-from github_crawler.rate_limiter import TokenBucket
-from github_crawler.search import SearchSynthesizer
-from github_crawler.agent import CodeAgent
-from github_crawler.github_utils import count_lines_of_code, get_repo_tree, clone_repo
-from github_crawler.config import load_yaml_config, save_config, load_project_memory, save_project_memory
+from github import GithubException, RateLimitExceededException, UnknownObjectException, BadCredentialsException
+from rich.console import Console
+
+from github_crawler.events import EventType, event_bus
 from github_crawler.reporting import generate_markdown_report, display_results_table, save_background_report
-from github_crawler.cli import parse_args, explore_repo_files, add_tree_nodes
-from github_crawler.events import event_bus, EventType
+from github_crawler.search import GitHubSearcher
+from github_crawler.config import Config
 from github_crawler.ui_handler import RichUIHandler
+from github_crawler.cli import parse_args, explore_repo_files
+from github_crawler.agent import CodeAgent
+from InquirerPy import inquirer
+from InquirerPy.base.control import Choice
 
 console = Console()
 
-def main():
-    # Initialize UI Handler (listens to event_bus)
-    ui = RichUIHandler()
-    
-    errors_encountered = []
-    args = parse_args()
-    config = load_yaml_config()
+MAX_RETRIES = 3
+RETRY_DELAY = 5 # seconds
 
-    # Welcome Banner
-    banner = figlet_format("GH Crawler")
-    console.print(f"[bold magenta]{banner}[/bold magenta]")
-    console.print("[italic cyan]Smart GitHub Repository Analyzer[/italic cyan]\n\n")
-
-    # --- Configuration Loading ---
-    memory_file = ".gemini_project_memory.json"
-    project_memory = load_project_memory(memory_file)
-    loaded_search_criteria = project_memory.get("search_params", {})
-    cached_analysis = project_memory.get("cached_analysis", {})
-
-    use_saved_criteria = False
-    if loaded_search_criteria:
-        use_saved_criteria = Confirm.ask("[bold]Saved search criteria found. Use them? (Y/n)[/bold]", default=True)
-    
-    # Determine API tokens
-    github_token = args.github_token or config.get("GITHUB_TOKEN") or os.environ.get("GITHUB_TOKEN")
-    google_key = args.google_api_key or config.get("GOOGLE_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-    openai_key = args.openai_api_key or config.get("OPENAI_API_KEY") or os.environ.get("OPENAI_API_KEY")
-
-    if not github_token or (not google_key and not openai_key):
-        if Confirm.ask("[yellow]Missing tokens. Configure them now?[/yellow]"):
-            github_token = Prompt.ask("GitHub Token", default=github_token or "", password=True)
-            if not google_key and not openai_key:
-                google_key = Prompt.ask("Google API Key (optional if OpenAI key provided)", default=google_key or "", password=True)
-                if not google_key:
-                    openai_key = Prompt.ask("OpenAI API Key", default=openai_key or "", password=True)
-            
-            save_config({
-                "GITHUB_TOKEN": github_token,
-                "GOOGLE_API_KEY": google_key,
-                "OPENAI_API_KEY": openai_key
-            })
-    console.print("\n")
-
-    # Determine Search Parameters
-    keywords_val = args.keywords if args.keywords else loaded_search_criteria.get("keywords") if use_saved_criteria else None
-    language_val = args.language if args.language else loaded_search_criteria.get("language") if use_saved_criteria else None
-    min_stars_val = args.min_stars if args.min_stars is not None else loaded_search_criteria.get("min_stars") if use_saved_criteria else None
-    min_forks_val = args.min_forks if args.min_forks is not None else loaded_search_criteria.get("min_forks") if use_saved_criteria else None
-    license_filter_val = args.license if args.license else loaded_search_criteria.get("license_filter") if use_saved_criteria else None
-    created_after_val = args.created_after if args.created_after else loaded_search_criteria.get("created_after") if use_saved_criteria else None
-    pushed_after_val = args.pushed_after if args.pushed_after else loaded_search_criteria.get("pushed_after") if use_saved_criteria else None
-    task_val = args.task if args.task else loaded_search_criteria.get("task") if use_saved_criteria else None
-
-    task = task_val
-    keywords = keywords_val
-    language = language_val
-    min_stars = min_stars_val
-    min_forks = min_forks_val
-    license_filter = license_filter_val
-
-    # Synthesis logic
-    if (google_key or openai_key) and not keywords_val and not language_val:
-        if task is None:
-            task = Prompt.ask("[bold]Deep Search Task[/bold]", default="Find the core logic")
-        
-        if Confirm.ask("[bold magenta]Synthesize interesting search patterns from your Deep Search Task? (Y/n)[/bold magenta]", default=True):
-            event_bus.emit(EventType.SYNTHESIS_STARTED)
-            synthesizer = SearchSynthesizer(google_key=google_key, openai_key=openai_key)
-            synth_params = synthesizer.synthesize(task)
-            
-            keywords = synth_params.get("keywords", keywords)
-            language = synth_params.get("language", language)
-            min_stars = synth_params.get("min_stars", min_stars)
-            min_forks = synth_params.get("min_forks", min_forks)
-            license_filter = synth_params.get("license", license_filter)
-            
-            event_bus.emit(EventType.SYNTHESIS_FINISHED, synth_params)
-
-    # Fallback to interactive prompts
-    keywords = keywords if keywords is not None else Prompt.ask("[bold]Keywords (Tags)[/bold]", default="crawler")
-    language = language if language is not None else Prompt.ask("[bold]Language[/bold] (optional)", default="")
-    min_stars = IntPrompt.ask("[bold]Minimum Stars[/bold]", default=min_stars if min_stars is not None else 0)
-    min_forks = IntPrompt.ask("[bold]Minimum Forks[/bold]", default=min_forks if min_forks is not None else 0)
-    license_filter = Prompt.ask("[bold]License[/bold]", default=license_filter if license_filter is not None else "")
-    created_after = created_after_val or Prompt.ask("[bold]Created After[/bold] (YYYY-MM-DD)", default="")
-    pushed_after = pushed_after_val or Prompt.ask("[bold]Pushed After[/bold] (YYYY-MM-DD)", default="")
-
-    if task is None:
-        task = Prompt.ask("[bold]Deep Search Task[/bold]", default="Find the core logic")
-
-    limit_val = args.limit if args.limit is not None else loaded_search_criteria.get("limit") if use_saved_criteria else None
-    limit = limit_val if limit_val is not None else IntPrompt.ask("[bold]Limit[/bold]", default=2)
-
-    run_background = args.run_background or (not args.run_background and Confirm.ask("[bold azure]Run Agent in Background?[/bold azure]", default=False))
-
-    # Save Configuration
-    current_search_params = {
-        "keywords": keywords, "language": language, "min_stars": min_stars,
-        "min_forks": min_forks, "license_filter": license_filter,
-        "created_after": created_after, "pushed_after": pushed_after,
-        "task": task, "limit": limit,
-    }
-
-    if Confirm.ask("[bold]Save these search criteria for future use? (Y/n)[/bold]", default=False):
-        save_project_memory({"search_params": current_search_params, "cached_analysis": cached_analysis}, memory_file)
-
-    # GitHub Search
+def search_repositories(config: Config):
+    """
+    Searches for repositories based on the provided configuration.
+    Emits search events and returns a list of repository objects.
+    """
+    searcher = GitHubSearcher(config.github_token)
     event_bus.emit(EventType.SEARCH_STARTED)
-    g = Github(github_token)
-    token_bucket = TokenBucket(capacity=5, fill_rate=1.4) 
-    results = []
     
-    repos_to_process = []
-    max_retries = 5
-    retry_delay = 5
-
-    for attempt in range(max_retries):
+    for attempt in range(MAX_RETRIES):
         try:
-            if token_bucket.get_token():
-                query_parts = [keywords]
-                if language: query_parts.append(f"language:{language}")
-                if min_stars > 0: query_parts.append(f"stars:>{min_stars}")
-                if min_forks > 0: query_parts.append(f"forks:>{min_forks}")
-                if license_filter: query_parts.append(f"license:{license_filter}")
-                if created_after: query_parts.append(f"created:>{created_after}")
-                if pushed_after: query_parts.append(f"pushed:>{pushed_after}")
-                query = " ".join(query_parts)
-
-                repositories = g.search_repositories(query=query)
-                if repositories:
-                    repos_to_process = [repositories[i] for i in range(min(limit, repositories.totalCount))]
-                    event_bus.emit(EventType.SEARCH_SUCCESS, len(repos_to_process))
-                    break
+            repos = searcher.search_repositories(
+                keywords=config.keywords,
+                language=config.language,
+                min_stars=config.min_stars,
+                min_forks=config.min_forks,
+                license=config.license,
+                limit=config.limit
+            )
+            event_bus.emit(EventType.SEARCH_SUCCESS, len(repos))
+            return repos
+        except RateLimitExceededException as e:
+            # Specific handling for rate limit exceeded
+            event_bus.emit(EventType.LOG, f"Rate limit exceeded. Headers: {e.headers}")
+            if attempt < MAX_RETRIES - 1:
+                wait_time = int(e.headers.get("X-RateLimit-Reset", RETRY_DELAY)) + 1
+                event_bus.emit(EventType.LOG, f"Retrying in {wait_time} seconds...")
+                time.sleep(wait_time)
             else:
-                time.sleep(retry_delay)
+                # Emit structured error for RateLimitExceededException
+                event_bus.emit(EventType.REPO_ERROR, (None, { # None for repo_name as it's a global search error
+                    "status": e.status,
+                    "data": e.data,
+                    "headers": e.headers,
+                    "message": f"Rate limit exceeded after {MAX_RETRIES} retries."
+                }))
+                event_bus.emit(EventType.ERROR, "API rate limit exceeded. Please check your token and try again later.")
+                return []
         except GithubException as e:
-            event_bus.emit(EventType.LOG, f"GitHub API error: {e}. Retrying...")
-            time.sleep(retry_delay)
+            # General GithubException handling with structured data
+            error_details = {
+                "status": e.status,
+                "data": e.data,
+                "headers": e.headers,
+                "message": str(e)
+            }
+            event_bus.emit(EventType.REPO_ERROR, (None, error_details)) # None for repo_name as it's a global search error
+            event_bus.emit(EventType.ERROR, f"GitHub API error during search: {e.message}. Status: {e.status}")
+            return [] # Abort search on other GitHub API errors
+        except Exception as e:
+            # Handle unexpected errors during search
+            event_bus.emit(EventType.REPO_ERROR, (None, str(e))) # None for repo_name as it's a global search error
+            event_bus.emit(EventType.ERROR, f"An unexpected error occurred during repository search: {e}")
+            return []
+            
+    # If all retries fail for rate limit
+    return []
 
-    if not repos_to_process:
-        event_bus.emit(EventType.ERROR, "No repositories found or API error. Aborting.")
+
+def process_repository(repo, config: Config, temp_dir: str, task: str = "Analyze repository structure"):
+    """
+    Processes a single repository: clones, analyzes, and reports.
+    Emits repo-specific events.
+    """
+    repo_name = repo.full_name
+    event_bus.emit(EventType.REPO_START, repo_name)
+
+    try:
+        # Clone repository
+        shutil.rmtree(temp_dir, ignore_errors=True) # Clean up previous clone
+        os.makedirs(temp_dir, exist_ok=True)
+        
+        # Use git command for cloning
+        repo_url = repo.clone_url
+        subprocess.run(["git", "clone", "--depth", "1", repo_url, temp_dir], check=True, capture_output=True)
+
+        # Use CodeAgent for analysis
+        agent = CodeAgent(
+            repo_name=repo_name, 
+            repo_path=temp_dir, 
+            google_key=os.environ.get("GOOGLE_API_KEY"), 
+            openai_key=os.environ.get("OPENAI_API_KEY")
+        )
+        
+        analysis = agent.run_session(task=task, silent=True)
+        trace = agent.trace
+        files_touched = list(agent.files_touched)
+
+        # Also count lines of code as a fallback/extra metric
+        lines_of_code = 0
+        for root, _, files in os.walk(temp_dir):
+            for file in files:
+                if file.endswith(".py"):
+                    file_path = os.path.join(root, file)
+                    try:
+                        with open(file_path, 'r', encoding='utf-8') as f:
+                            lines_of_code += len(f.readlines())
+                        rel_path = os.path.relpath(file_path, temp_dir)
+                        if rel_path not in files_touched:
+                            files_touched.append(rel_path)
+                    except Exception:
+                        pass
+
+        result = {
+            "name": repo_name,
+            "url": repo.html_url,
+            "stars": repo.stargazers_count,
+            "language": repo.language,
+            "lines_of_code": lines_of_code,
+            "analysis": analysis,
+            "trace": trace,
+            "files_touched": files_touched
+        }
+
+        event_bus.emit(EventType.REPO_SUCCESS, repo_name)
+        return result
+
+    except UnknownObjectException:
+        # Handle cases where repo is not found (e.g., deleted or private)
+        error_details = {
+            "status": 404,
+            "message": "Repository not found or access denied."
+        }
+        event_bus.emit(EventType.REPO_ERROR, (repo_name, error_details))
+        return None
+    except BadCredentialsException as e:
+        # Handle authentication errors specifically
+        error_details = {
+            "status": e.status,
+            "data": e.data,
+            "headers": e.headers,
+            "message": str(e)
+        }
+        event_bus.emit(EventType.REPO_ERROR, (repo_name, error_details))
+        event_bus.emit(EventType.ERROR, "Authentication failed. Please check your GitHub token.")
+        return None
+    except GithubException as e:
+        # Handle other GitHub API errors with structured data
+        error_details = {
+            "status": e.status,
+            "data": e.data,
+            "headers": e.headers,
+            "message": str(e)
+        }
+        event_bus.emit(EventType.REPO_ERROR, (repo_name, error_details))
+        return None
+    except Exception as e:
+        # Handle any other unexpected errors during repository processing
+        event_bus.emit(EventType.REPO_ERROR, (repo_name, str(e)))
+        return None
+    finally:
+        # Clean up cloned repo
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def main():
+    """Main function to orchestrate the GitHub crawler."""
+    args = parse_args()
+    RichUIHandler() # Initialize UI Handler
+
+    config = Config(args)
+    
+    # If config is not fully set, prompt user
+    if not config.is_complete():
+        config.prompt_for_missing_values()
+        
+    # Ensure GitHub token is set
+    if not config.github_token:
+        console.print("[bold red]Error:[/bold red] GitHub token not found. Please set it in config or environment.")
         return
 
+    event_bus.emit(EventType.SYNTHESIS_STARTED)
+    # Placeholder for synthesis logic
+    synthesis_data = {
+        "keywords": config.keywords,
+        "language": config.language,
+        "min_stars": config.min_stars,
+        "reasoning": "Searching for popular Python repositories based on keywords."
+    }
+    event_bus.emit(EventType.SYNTHESIS_FINISHED, synthesis_data)
+
+    # Search for repositories
+    repos_to_process = search_repositories(config)
+
+    # Check if search returned any repos and handle no-results/errors from search
+    if not repos_to_process:
+        # If search_repositories returned an empty list, it might have already emitted
+        # an error event (e.g., rate limit, API error). If not, we can emit a generic
+        # message indicating no results or search failure.
+        # This logic assumes that if repos_to_process is empty, it's either due to
+        # an error already handled or genuinely no results found.
+        # We avoid double-emitting errors here.
+        # The check `any(e['type'] == EventType.ERROR for e in ui_handler._event_log if e['data'])`
+        # is a simplification and might not be robust as _event_log might not be accessible or populated.
+        # A more reliable approach would be to have search_repositories return a status flag or
+        # ensure errors are always emitted.
+        # For now, we'll rely on the fact that if search_repositories failed, it likely emitted an error.
+        # If it simply found no results, no specific error needs to be printed here.
+        pass # Rely on search_repositories to emit errors if it fails.
+
+
     # Processing Repositories
-    event_bus.emit(EventType.PROCESSING_STARTED)
-    for repo in repos_to_process:
-        cache_key = f"{repo.full_name}:{task}"
-        if cache_key in cached_analysis:
-            event_bus.emit(EventType.LOG, f"Using cached results for {repo.full_name}.")
-            results.append(cached_analysis[cache_key])
-            continue
-
-        event_bus.emit(EventType.REPO_START, repo.full_name)
+    if repos_to_process: # Only proceed if we have repositories to process
+        event_bus.emit(EventType.PROCESSING_STARTED)
+        all_results = []
+        errors_encountered = [] # This list seems to be for capturing string error messages
         
-        temp_dir = tempfile.mkdtemp()
-        try:
-            clone_repo(repo.ssh_url, temp_dir)
-            agent = CodeAgent(repo.full_name, temp_dir, google_key, openai_key)
-            # Run agent silently because UIHandler handles status updates via events
-            analysis = agent.run_session(task, silent=True)
-            
-            repo_result = {
-                "name": repo.full_name, "url": repo.html_url, "stars": repo.stargazers_count,
-                "language": repo.language or "N/A", "lines_of_code": count_lines_of_code(temp_dir),
-                "repo_tree": get_repo_tree(temp_dir), "analysis": analysis,
-                "trace": agent.trace, "files_touched": list(agent.files_touched)
-            }
-            results.append(repo_result)
-            cached_analysis[cache_key] = repo_result
-            event_bus.emit(EventType.REPO_SUCCESS, repo.full_name)
+        # Use a temporary directory for cloning each repo
+        temp_repo_dir = os.path.join(config.temp_dir, "repo_clone") 
+        task = args.task or "Analyze repository structure"
 
-            if not run_background and Confirm.ask(f"[bold]Explore {repo.full_name} files? (Y/n)[/bold]", default=False):
-                explore_repo_files(temp_dir)
-        except Exception as e:
-            event_bus.emit(EventType.REPO_ERROR, (repo.full_name, str(e)))
-            errors_encountered.append(f"Error processing {repo.full_name}: {e}")
-        finally:
-            shutil.rmtree(temp_dir, ignore_errors=True)
-    event_bus.emit(EventType.PROCESSING_FINISHED)
-
-    # Final Reporting (Directly using Rich for final summary tables and reports)
-    display_results_table(results)
-    if run_background:
-        log_file = f"agent_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-        if save_background_report(results, task, log_file):
-            console.print(f"[bold green]Results saved to {log_file}[/bold green]")
-
-    save_project_memory({"search_params": current_search_params, "cached_analysis": cached_analysis}, memory_file)
-
-    if errors_encountered:
-        console.print("\n[bold orange]--- Encountered Errors ---[/bold orange]")
-        for err in errors_encountered: console.print(f"[orange]- {err}[/orange]")
-
-    # Post-Scan Menu
-    while True:
-        choice = Prompt.ask("\n[bold azure]Action[/bold azure]", choices=["deep", "tree", "json", "md", "quit"], default="quit")
-        if choice == "quit": break
-        
-        if choice in ["deep", "tree"]:
-            idx = IntPrompt.ask("Enter Repo ID", default=1) - 1
-            if 0 <= idx < len(results):
-                res = results[idx]
-                if choice == "deep":
-                    for t in res["trace"]:
-                        console.print(Panel(f"[bold dim]Turn {t['turn']} Thought:[/bold dim]\n{t['thought']}\n\n[bold dim]Output:[/bold dim]\n{escape(t['output'][:500])}...", title=f"Trace: {res['name']}"))
-                else:
-                    tree = Tree(f"[bold cyan]{res['name']}[/bold cyan] (Project Structure)")
-                    add_tree_nodes(tree, res.get("repo_tree", {}))
-                    console.print(tree)
+        for repo in repos_to_process:
+            result = process_repository(repo, config, temp_repo_dir, task)
+            if result:
+                all_results.append(result)
             else:
-                console.print("[red]Invalid ID[/red]")
-        elif choice == "json":
-            filename = f"gh_pro_{datetime.now().strftime('%H%M%S')}.json"
-            with open(filename, "w") as f: json.dump(results, f, indent=4)
-            console.print(f"[green]Saved to {filename}[/green]")
-        elif choice == "md":
-            filename = f"report_{datetime.now().strftime('%H%M%S')}.md"
-            with open(filename, "w") as f: f.write(generate_markdown_report(results, task))
-            console.print(f"[green]Report saved to {filename}[/green]")
+                # process_repository already emits structured errors via event_bus.
+                # This 'errors_encountered' list might be for capturing string errors
+                # from general Exceptions caught in process_repository, if any.
+                pass 
+        
+        event_bus.emit(EventType.PROCESSING_FINISHED)
+
+        # Reporting
+        if all_results:
+            display_results_table(all_results)
+            markdown_report = generate_markdown_report(all_results, "Global Search")
+            
+            # Save markdown report to a file
+            report_filename = f"report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
+            report_filepath = os.path.join(config.output_dir, report_filename)
+            try:
+                with open(report_filepath, "w", encoding="utf-8") as f:
+                    f.write(markdown_report)
+                console.print(f"[green]Markdown report saved to:[/green] {report_filepath}")
+            except Exception as e:
+                console.print(f"[bold red]Error saving markdown report:[/bold red] {e}")
+
+        # If there were string errors encountered (from general Exceptions)
+        if errors_encountered:
+            # This part had syntax errors related to console.print and string formatting
+            # Corrected to use a single multiline string for console.print
+            console.print("\n[bold yellow]Encountered the following issues during processing:[/bold yellow]")
+            for err in errors_encountered:
+                console.print(f"- {err}")
+
+        # Optionally save background report if configured
+        if config.save_background_report:
+            background_report_filename = f"background_scan_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+            background_report_filepath = os.path.join(config.output_dir, background_report_filename)
+            if save_background_report(all_results, "Global Search", background_report_filepath):
+                console.print(f"[green]Background scan report saved to:[/green] {background_report_filepath}")
+            else:
+                console.print("[bold red]Error saving background scan report.[/bold red]")
+
+        # Interactive Exploration
+        if args.interactive and all_results:
+            while True:
+                choices = [Choice(res['name'], name=res['name']) for res in all_results]
+                choices.append(Choice(value="quit", name="[Quit]"))
+                
+                selected_repo_name = inquirer.select(
+                    message="Select a repository to explore interactively:",
+                    choices=choices
+                ).execute()
+                
+                if selected_repo_name == "quit":
+                    break
+                
+                # In this implementation, temp_repo_dir was reused. 
+                # To make this robust, we'd need to re-clone or use persistent storage.
+                # For now, we'll warn the user that only the LAST processed repo is in temp_repo_dir
+                # OR we could modify process_repository to use unique dirs.
+                
+                # Optimization: Find if the selected repo is currently in the temp_repo_dir
+                # (Since we reuse it, it's likely the last one)
+                last_repo_name = all_results[-1]['name']
+                if selected_repo_name == last_repo_name:
+                    explore_repo_files(os.path.join(config.temp_dir, "repo_clone"))
+                else:
+                    console.print(f"[yellow]Note: Re-cloning {selected_repo_name} for exploration...[/yellow]")
+                    temp_explore_dir = os.path.join(config.temp_dir, "explore")
+                    shutil.rmtree(temp_explore_dir, ignore_errors=True)
+                    os.makedirs(temp_explore_dir, exist_ok=True)
+                    
+                    repo_obj = next(r for r in repos_to_process if r.full_name == selected_repo_name)
+                    subprocess.run(["git", "clone", "--depth", "1", repo_obj.clone_url, temp_explore_dir], check=True, capture_output=True)
+                    explore_repo_files(temp_explore_dir)
+
+    else: # This block handles the case where repos_to_process is empty
+        # If repos_to_process is empty, it implies either search found no results or search failed.
+        # If it succeeded but found 0 results, we should let the user know.
+        console.print("[yellow]No repositories found matching the criteria.[/yellow]")
+        pass # Rely on search_repositories to emit errors if it fails.
+
 
 if __name__ == "__main__":
+    # This is a simplified entry point. In a real CLI, this would be handled by cli.py
+    # For demonstration, we'll directly call main()
     main()

@@ -3,7 +3,7 @@ import os
 import shutil
 import tempfile
 import unittest
-from github_crawler.main import count_lines_of_code, get_repo_tree
+from github_crawler.github_utils import count_lines_of_code, get_repo_tree
 
 class TestCrawlerUtils(unittest.TestCase):
     def setUp(self):

@@ -1,8 +1,11 @@
 import json
+import re
 from google import genai
 import openai
 from abc import ABC, abstractmethod
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
+from github import Github
+from github_crawler.events import EventType, event_bus
 
 class AIProvider(ABC):
     @abstractmethod
@@ -18,12 +21,20 @@ class GoogleAIProvider(AIProvider):
             model='gemini-1.5-flash',
             contents=prompt
         )
+        if not response.text:
+            return "{}"
+            
         text = response.text.strip()
-        # Clean up potential markdown wrapping
-        if "```json" in text:
-            text = text.split("```json")[1].split("```")[0].strip()
-        elif "```" in text:
-            text = text.split("```")[1].split("```")[0].strip()
+        
+        # More robust JSON extraction using regex
+        json_match = re.search(r'```json\s*(.*?)\s*```', text, re.DOTALL)
+        if json_match:
+            return json_match.group(1).strip()
+            
+        json_match = re.search(r'```\s*(.*?)\s*```', text, re.DOTALL)
+        if json_match:
+            return json_match.group(1).strip()
+            
         return text
 
 class OpenAIProvider(AIProvider):
@@ -39,6 +50,8 @@ class OpenAIProvider(AIProvider):
             ],
             response_format={ "type": "json_object" }
         )
+        if not response.choices:
+            return "{}"
         return response.choices[0].message.content
 
 class SearchSynthesizer:
@@ -86,9 +99,42 @@ class SearchSynthesizer:
         
         try:
             text = self.provider.synthesize(prompt)
+            if not text or text.strip() == "":
+                return {"keywords": deep_query, "reasoning": "Provider returned empty response."}
             return json.loads(text)
         except Exception as e:
             return {
                 "keywords": deep_query,
                 "reasoning": f"Synthesis error via {self.provider.__class__.__name__}: {str(e)}"
             }
+
+class GitHubSearcher:
+    def __init__(self, token: str):
+        self.gh = Github(token, timeout=15)
+
+    def search_repositories(self, keywords: str, language: Optional[str] = None, 
+                            min_stars: Optional[int] = None, min_forks: Optional[int] = None,
+                            license: Optional[str] = None, limit: int = 10) -> List[Any]:
+        query = keywords
+        if language:
+            query += f" language:{language}"
+        if min_stars:
+            query += f" stars:>={min_stars}"
+        if min_forks:
+            query += f" forks:>={min_forks}"
+        if license:
+            query += f" license:{license}"
+        
+        event_bus.emit(EventType.LOG, f"Sending search query to GitHub: {query}")
+        repositories = self.gh.search_repositories(query=query)
+        # Convert PaginatedList to a regular list (limiting based on config)
+        results = []
+        try:
+            for i, repo in enumerate(repositories):
+                if i >= limit:
+                    break
+                results.append(repo)
+                event_bus.emit(EventType.LOG, f"Found repository: {repo.full_name}")
+        except Exception as e:
+            raise e
+        return results

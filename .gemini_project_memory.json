@@ -1,0 +1,14 @@
+{
+    "search_params": {
+        "keywords": "android NativeActivity GameActivity",
+        "language": "Java",
+        "min_stars": 25,
+        "min_forks": 0,
+        "license_filter": "",
+        "created_after": "",
+        "pushed_after": "",
+        "task": "android projects with at least 25 stars that either use NativeActivity or GameActivity",
+        "limit": 100
+    },
+    "cached_analysis": {}
+}

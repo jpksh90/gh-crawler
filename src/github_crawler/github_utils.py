@@ -1,7 +1,5 @@
 import os
 import subprocess
-from github import Github, GithubException
-from github_crawler.rate_limiter import TokenBucket
 
 def count_lines_of_code(repo_path: str):
     """

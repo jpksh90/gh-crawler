@@ -11,6 +11,7 @@ dependencies = [
     "rich>=13.0.0",
     "PyYAML>=6.0.0",
     "pyfiglet>=1.0.2",
+    "inquirerpy>=0.3.4",
 ]
 
 [project.scripts]
@@ -22,3 +23,9 @@ packages = ["src/github_crawler"]
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+    "ruff>=0.15.10",
+]

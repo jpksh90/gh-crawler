@@ -2,10 +2,9 @@ import argparse
 import os
 from rich.console import Console
 from rich.tree import Tree
-from rich.prompt import Prompt, IntPrompt, Confirm
+from rich.prompt import Prompt
 from rich.panel import Panel
 from rich.syntax import Syntax
-from rich.markup import escape
 
 console = Console()
 
@@ -25,6 +24,7 @@ def parse_args():
     parser.add_argument("--task", type=str, help="The specific analysis task to perform on cloned repositories.")
     parser.add_argument("--limit", type=int, help="Maximum number of repositories to process.")
     parser.add_argument("--run-background", action="store_true", help="Run analysis in the background and save output to a file.")
+    parser.add_argument("--interactive", action="store_true", help="Interactively explore repositories after scanning.")
     
     # API Key Arguments
     parser.add_argument("--github-token", type=str, help="GitHub API token.")

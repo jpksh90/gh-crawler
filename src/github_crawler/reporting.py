@@ -1,12 +1,11 @@
 from datetime import datetime
-import json
 from rich.console import Console
 from rich.table import Table
 
 console = Console()
 
 def generate_markdown_report(results, task):
-    md = f"# GH Crawler Smart Search Report\n\n"
+    md = "# GH Crawler Smart Search Report\n\n"
     md += f"**Task:** {task}\n\n"
     md += f"**Generated On:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
     
