@@ -1,6 +1,6 @@
 # GH Crawler Pro 🚀
 
-A high-performance GitHub repository crawler and AI-powered code analysis agent. Search across repositories and use a smart AI agent to perform deep-dive analysis on the discovered code.
+A GitHub repository crawler and AI-powered code analysis agent. Search across repositories and use a smart AI agent to perform deep-dive analysis on the discovered code.
 
 ## 🌟 Key Features
 
