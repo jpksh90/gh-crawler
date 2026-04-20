@@ -1,6 +1,7 @@
 import os
 import time
 from datetime import datetime
+import subprocess
 
 from github import GithubException, RateLimitExceededException, UnknownObjectException, BadCredentialsException
 from rich.console import Console
@@ -22,6 +23,10 @@ console = Console()
 
 MAX_RETRIES = 3
 RETRY_DELAY = 5 # seconds
+
+# Constants for Joern integration
+JOERN_CONSOLE_CMD = "joern-console"
+JOERN_CPG_DIR_NAME = "joern_cpgs"
 
 def synthesize_scan_spec(config: Config, task: str):
     synthesizer = SearchSynthesizer(
@@ -169,6 +174,55 @@ def process_repository(repo, session, task: str):
             "clone_path": clone_dir,
         }
 
+        # --- Joern Integration Start ---
+        joern_cpg_session_base_dir = os.path.join(session.session_dir, JOERN_CPG_DIR_NAME)
+        # Sanitize repo name for directory creation: replace '/' with '_' and remove other potentially problematic chars
+        sanitized_repo_name = repo_name.replace('/', '_').replace('', '_').replace(':', '_').replace('*', '_').replace('?', '_').replace('"', '_').replace('<', '_').replace('>', '_').replace('|', '_')
+        repo_joern_cpg_dir = os.path.join(joern_cpg_session_base_dir, sanitized_repo_name)
+
+        # Create the base directory for Joern CPGs if it doesn't exist
+        create_base_dir_cmd = f"mkdir -p {joern_cpg_session_base_dir}"
+        event_bus.emit(EventType.LOG, f"{repo_name}: creating Joern CPG base directory: {joern_cpg_session_base_dir}")
+        run_shell_command(command=create_base_dir_cmd, description="Create Joern CPG base directory")
+        
+        # Create the specific directory for this repo's CPG if it doesn't exist
+        create_repo_dir_cmd = f"mkdir -p {repo_joern_cpg_dir}"
+        event_bus.emit(EventType.LOG, f"{repo_name}: creating Joern CPG directory for repo: {repo_joern_cpg_dir}")
+        run_shell_command(command=create_repo_dir_cmd, description="Create Joern CPG directory for repository")
+
+        joern_command = f"{JOERN_CONSOLE_CMD} importCode {clone_dir}"
+        event_bus.emit(EventType.LOG, f"{repo_name}: starting Joern scan in {repo_joern_cpg_dir}")
+
+        # Execute Joern command using run_shell_command, setting the working directory to the CPG output dir
+        # This ensures joern.bin is created in the correct CPG directory
+        joern_result = run_shell_command(
+            command=joern_command,
+            dir_path=repo_joern_cpg_dir,
+            description=f"Run Joern import for {repo_name}"
+        )
+
+        joern_status = "success"
+        joern_output = joern_result.output
+        joern_error = joern_result.error # This captures process-level errors if any
+        
+        if joern_result.exit_code != 0:
+            joern_status = "failed"
+            event_bus.emit(EventType.LOG, f"{repo_name}: Joern scan failed. Exit code: {joern_result.exit_code}. Output: {joern_output}")
+            # Add error details to the main result as well
+            result["joern_scan_error"] = f"Exit code: {joern_result.exit_code}. Output: {joern_output}. Error: {joern_error}"
+        else:
+            event_bus.emit(EventType.LOG, f"{repo_name}: Joern scan completed successfully.")
+            # Joern creates joern.bin in the specified dir_path. We can just record the path.
+
+        result["joern_scan"] = {
+            "status": joern_status,
+            "output": joern_output,
+            "exit_code": joern_result.exit_code, # Store exit code for clarity
+            "error_message": joern_error, # Store process-level error if any
+            "cpg_path": repo_joern_cpg_dir, # Path where joern.bin should be created
+        }
+        # --- Joern Integration End ---
+
         event_bus.emit(EventType.REPO_SUCCESS, repo_name)
         return result
 
@@ -203,7 +257,8 @@ def process_repository(repo, session, task: str):
         return None
     except Exception as e:
         # Handle any other unexpected errors during repository processing
-        event_bus.emit(EventType.REPO_ERROR, (repo_name, str(e)))
+        # This also catches potential errors from run_shell_command if they aren't caught by exit_code logic
+        event_bus.emit(EventType.REPO_ERROR, (repo_name, f"Error during repository processing: {str(e)}"))
         return None
 
 
